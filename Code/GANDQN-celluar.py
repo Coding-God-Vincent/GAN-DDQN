@@ -23,7 +23,7 @@ from utils.ReplayMemory import ExperienceReplayMemory, PrioritizedReplayMemory
 from utils.utils import initialize_weights
 
 
-#%%
+#%%  # 就像 Ipynb 一樣的功能，把程式碼切成一個一個的 Cell
 class Generator(nn.Module):
     def __init__(self, state_size, num_actions, num_samples, embedding_dim):
         super(Generator, self).__init__()
@@ -71,7 +71,7 @@ class Generator(nn.Module):
         
         return net
     
-#%%
+#%%  
 class Discriminator(nn.Module):
     def __init__(self, num_samples, num_outputs):
         super(Discriminator, self).__init__()
@@ -94,7 +94,8 @@ class Discriminator(nn.Module):
 
         return out
 
-class LinearSchedule(object):
+# 做線性衰弱，用於控制 ɛ-greedy
+class LinearSchedule(object): 
     def __init__(self, schedule_timesteps, start_timesteps, final_p, initial_p=1.0):
         """Linear interpolation between initial_p and final_p over
         schedule_timesteps. After this many timesteps pass final_p is
