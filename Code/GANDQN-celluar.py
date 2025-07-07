@@ -367,18 +367,25 @@ class WGAN_GP_Agent(object):
         print('expected q value', expected_q_values_samples.mean(1))
 
     
-def action_space(total, num):
-    tmp = list(itertools.product(range(total + 1), repeat=num))
+def action_space(total, num):  # total = 10 (total_band = 10MHz)，num = 3 (3 types of NS)
+    tmp = list(itertools.product(range(total + 1), repeat=num))  # itertools.product() : 產出所有 0~10 中取 3 個數字的所有組合。將 (x, y, z) 存入 tmp
     result = []
-    for value in tmp:
+    # 從一堆 (x, y, z) 中挑出 x + y + z = 10 的組合存入 result
+    for value in tmp:  # 
         if sum(value) == total:
             result.append(list(value))
     result = np.array(result)
-    [i, j] = np.where(result == 0)
-    result = np.delete(result, i, axis=0)
+    
+    [i, j] = np.where(result == 0)  # 找出 result 中那些 [x, y, z] 其中任一為 0 的組合。
+    result = np.delete(result, i, axis=0)  # 刪除那些任一為 0 的組合
+    # example : 
+    # result = [ [3, 3, 4], [2, 4, 4], [5, 5, 0], [6, 4, 0] ]
+    # result = np.array(result)
+    # np.where(result == 0)
+    # return : (array([2, 3]), array([2, 2]))  # 回傳 0 的位址。i = [2, 3] (2 個零所在的列數)，j = [2, 2] (2 個零所在的行數)
     print(result.shape)
 
-    return result
+    return result  # x + y + z = 10，且任一不為 0
 
 def state_update(state, ser_cat):
     discrete_state = np.zeros(state.shape)

@@ -1,6 +1,6 @@
 '''
 For downlink simulations in one-single base station environment
-
+This simulation is based on 4G LTE.
 
 '''
 
@@ -39,6 +39,7 @@ class cellularEnv(object):
         # 由上可以合理推出本模擬使用的頻段是 [2GHz - 5MHz, 2GHz + 5MHz]
 
         # LTE 的一個 subframe = 1ms，一個 slot = 0.5ms。(1 subframe = 2 slots)
+        # 這邊應該是指一個 timeslot = 0.5ms
         time_subframe = 0.5 * 10 ** (-3), # by LTE, 0.5 ms
 
         # 用 RR 來做網路切片到使用者之間的分配
@@ -71,18 +72,27 @@ class cellularEnv(object):
 
         self.chan_mod = chan_mod
         
-        self.time_subframe = round(time_subframe,4)
+        self.time_subframe = round(time_subframe, 4)
         self.sys_clock = 0
 
         self.schedu_method = schedu_method 
 
         self.UE_max_no = UE_max_no
-        self.UE_buffer = np.zeros([Queue_max,UE_max_no])
-        self.UE_buffer_backup = np.zeros([Queue_max,UE_max_no])
-        self.UE_latency = np.zeros([Queue_max,UE_max_no])
+        # 存所有 UE 目前的 Queue 使用情況
+        self.UE_buffer = np.zeros([Queue_max, UE_max_no])  # 創建一個 shape = (Queue_max, UE_max_no) 的零矩陣
+        # 備份 UE_buffer，可以用來算 SLA
+        self.UE_buffer_backup = np.zeros([Queue_max, UE_max_no])
+        # 存所有 UE 的各封包的 Latency 情況 (unit = sec.)
+        self.UE_latency = np.zeros([Queue_max, UE_max_no])
+        # 存所有 UE 下一個封包可以產生的時間，當值為 0 的時候才可以產生新的封包
         self.UE_readtime = np.zeros(UE_max_no)
+        # 存每個 UE 在當前 timeslot 分到多少頻寬
         self.UE_band = np.zeros(UE_max_no)
-        UE_pos = np.random.uniform(-self.BS_radius, self.BS_radius, [self.UE_max_no,2])
+        # 隨機生成所有 UE 的位置
+        # [-self.BS_radius, self.BS_radius] 中均勻隨機產生出一個 shape 為 [self.UE_max_no, 2] 的二維陣列
+        UE_pos = np.random.uniform(-self.BS_radius, self.BS_radius, [self.UE_max_no, 2])
+        # 計算每個 UE 到基地台的距離 sqrt( (x1 - x2)^2 + (y1 - y2)^2 )
+        # shape = (UE_max_no, 1)，即每一個 UE 跟 BS 的距離
         dis = np.sqrt(np.sum((BS_pos - UE_pos) **2 , axis = 1)) / 1000 # unit changes to km
         
         self.path_loss = 145.4 + 37.5 * np.log10(dis).reshape(-1,1)
