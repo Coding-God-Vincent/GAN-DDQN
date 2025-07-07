@@ -9,35 +9,73 @@ import time
 
 class cellularEnv(object):
     def __init__(self,
+                 
+        # Base Station Position & Area
         BS_pos = np.array([0,0]),
         BS_radius = 40,
-        #BS_tx_power = 0, #unit is dBW
-        BS_tx_power = 16, #unit is dBW, 46dBm
+        
+        # BS transmit power # tx = transmit
+        # unit is dBW (16dbW = 46dBm) # 為常見的 LTE 傳輸功率
+        BS_tx_power = 16, 
+
+        # 最大 UE 個數
         UE_max_no = 100, 
+        # 每個 UE 最多可以一次處理五個 packets
         Queue_max = 5,
-        noise_PSD = -204, # -174 dbm/Hz
+
+        # 噪聲功率譜密度 (unit = dbw/Hz) 用於算 SNR
+        # noise Power Spectral Density
+        # 每 Hz 有多少功率的噪聲
+        noise_PSD = -204, # 約-174 dbm/Hz
+
+        # 使用的通道模型為 3GPP TR 36.814 (常用於 LTE 模擬)
+        # 包含 Path Loss 和 Shadow Fading
         chan_mod = '36814',
-        carrier_freq = 2 * 10 ** 9, #2 GHz
+        
+        # 用在說明使用的頻段的中心頻率，即使用哪一段的 spectrum
+        carrier_freq = 2 * 10 ** 9, # 2 GHz
+        # 總共可用頻寬為 10MHz
+        band_whole = 10 * 10 ** 6, # unit = Hz
+        # 由上可以合理推出本模擬使用的頻段是 [2GHz - 5MHz, 2GHz + 5MHz]
+
+        # LTE 的一個 subframe = 1ms，一個 slot = 0.5ms。(1 subframe = 2 slots)
         time_subframe = 0.5 * 10 ** (-3), # by LTE, 0.5 ms
-        ser_cat = ['volte','embb_general','urllc'],
-        band_whole = 10 * 10 ** 6, # 10MHz
+
+        # 用 RR 來做網路切片到使用者之間的分配
         schedu_method = 'round_robin',
+        
+        # 網路切片種類 (VoLTE、eMBB、URLLC)
+        ser_cat = ['volte','embb_general','urllc'],
+        # 隨機分配 UE 的服務需求 (VoLTE : eMBB : URLLC = 6 : 6 : 1)
         ser_prob = np.array([6,6,1], dtype=np.float32),
+
+        # MIMO 天線數
         dl_mimo = 32,
+        # UE 端 (接收端) 的增益，跟距離無關，是硬體的能力 (結構)。可以把接收到的訊號的功率放大 20dB
+        # rx = receive
         rx_gain = 20, #dB
+
+        # RL 的學習視窗，即學習一次會經過幾個 time_subframes
+        # 可以得出一次訓練會要 60000 * 0.5ms = 30s
         learning_windows = 60000,
         ):
+
         self.BS_tx_power = BS_tx_power
         self.BS_radius = BS_radius
-        self.band_whole = band_whole
-        self.chan_mod = chan_mod
+        
         self.carrier_freq = carrier_freq
-        self.time_subframe = round(time_subframe,4)
+        self.band_whole = band_whole
         self.noise_PSD = noise_PSD
-        self.sys_clock = 0
-        self.schedu_method = schedu_method 
         self.dl_mimo = dl_mimo
         self.UE_rx_gain = rx_gain
+
+        self.chan_mod = chan_mod
+        
+        self.time_subframe = round(time_subframe,4)
+        self.sys_clock = 0
+
+        self.schedu_method = schedu_method 
+
         self.UE_max_no = UE_max_no
         self.UE_buffer = np.zeros([Queue_max,UE_max_no])
         self.UE_buffer_backup = np.zeros([Queue_max,UE_max_no])
@@ -46,6 +84,7 @@ class cellularEnv(object):
         self.UE_band = np.zeros(UE_max_no)
         UE_pos = np.random.uniform(-self.BS_radius, self.BS_radius, [self.UE_max_no,2])
         dis = np.sqrt(np.sum((BS_pos - UE_pos) **2 , axis = 1)) / 1000 # unit changes to km
+        
         self.path_loss = 145.4 + 37.5 * np.log10(dis).reshape(-1,1)
         self.learning_windows = round(learning_windows*self.time_subframe,4)
         self.ser_cat = ser_cat
