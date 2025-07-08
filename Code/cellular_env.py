@@ -89,7 +89,7 @@ class cellularEnv(object):
         # 創建一個 shape = (Queue_max (5), UE_max_no (100)) 的零矩陣
         # 有 5 個 np.ndarray，每個 array 中有 100 格，所以某一個 array 代表隊應所有 UE 的 Queue 的某一格
         self.UE_buffer = np.zeros([Queue_max, UE_max_no])  
-        # 備份 UE_buffer，可以用來算 SLA
+        # 備份 UE_buffer，存 buffer 中每個封包的原始大小，用在 store_reward() 那邊，算花超過一個 timeslot 傳送的封包的傳輸速率 (原始封包大小 / 總 latency = 該封包的資料傳輸速率)
         self.UE_buffer_backup = np.zeros([Queue_max, UE_max_no])
         # 存所有 UE 的各封包的 Latency 情況 (unit = sec.)
         self.UE_latency = np.zeros([Queue_max, UE_max_no])
@@ -272,55 +272,72 @@ class cellularEnv(object):
         self.bufferClear()
         
     #=======================================================================================================================================#
-    # 每個 UE 依照其隸屬的網路切片種類，以不同的大小和間隔時間產生封包並放進其對應的 Queue 中
+    # 每個 UE 依照其隸屬的網路切片種類，以間隔時間產生不同大小的封包並放進其對應的 Queue 中
+    # 若 UE 對應的 Queue 是滿的就不產生，空的的話就產生一個
     def activity(self): #https://www.ngmn.org/fileadmin/user_upload/NGMN_Radio_Access_Performance_Evaluation_Methodology.pdf
         # VoLTE uses the VoIP model
         # embb_general uses the video streaming model
         # urllc uses the FTP2 model
+
+        # 設定使用者的 readtime，即隔多久會再產生一筆資料進入 buffer 的時間間隔，各 UE 的 readtime 會存入 self.UE_readtime
         if self.sys_clock == 0:  # 模擬剛開始，初始化
             for ser_name in self.ser_cat:  # 一次考慮一種網路切片
                 ue_index = np.where(self.UE_cat == ser_name)  # ue_index : 隸屬於該網路切片的使用者的 index
                 ue_index_Size = ue_index[0].size
                 
                 if ser_name == 'volte':
-                    self.UE_readtime[ue_index] = np.random.uniform(0,160 * 10 ** (-3),[1,ue_index_Size]) # the silence lasts 160 ms in maximum
+                    # the silence lasts 160 ms in maximum
+                    # readtime 用 (0, 160ms) 隨機分布，產生 size 為 (1, ue_index_Size) 的 np.ndarray
+                    self.UE_readtime[ue_index] = np.random.uniform(0, 160 * 10 ** (-3), [1, ue_index_Size]) 
 
                 elif ser_name == 'embb_general':
-                    tmp_readtime = np.random.pareto(1.2,[1,ue_index_Size]) * 6 * 10 ** -3
-                    tmp_readtime[tmp_readtime > 12.5 * 10 ** -3] = 12.5 * 10 ** -3
+                    tmp_readtime = np.random.pareto(1.2, [1, ue_index_Size]) * 6 * 10 ** -3
+                    tmp_readtime[tmp_readtime > 12.5 * 10 ** -3] = 12.5 * 10 ** -3  # readtime 上限為 12.5 ms，超過者設為 12.5 ms
                     self.UE_readtime[ue_index]  = tmp_readtime
 
                 elif ser_name == 'urllc':
-                    self.UE_readtime[ue_index]  = np.random.exponential(180* 10 ** -3,[1,ue_index_Size]) # read time is determines much smaller; the spec shows the average time is 180s, but here it is defined as 180 ms
+                    # read time is determines much smaller; the spec shows the average time is 180s, but here it is defined as 180 ms
+                    # 模擬突發封包
+                    self.UE_readtime[ue_index]  = np.random.exponential(180* 10 ** -3, [1, ue_index_Size]) 
 
-        for ue_id in range(self.UE_max_no):
-            if self.UE_readtime[ue_id] <= 0:
-                if self.UE_buffer[:,ue_id].size - np.count_nonzero(self.UE_buffer[:,ue_id]) != 0: # The buffer is not full
-                    buf_ind = np.where(self.UE_buffer[:,ue_id] == 0)[0][0]
+        # 針對每個 UE 看是否要產生新的封包，封包大小的單位為 bits
+        for ue_id in range(self.UE_max_no):  # 每次考慮一個 UE
+
+            if self.UE_readtime[ue_id] <= 0: # 到了 readtime，該產生封包
+                # buffer 如果是空的就產生封包，如果不是空的就不產生
+                if self.UE_buffer[:, ue_id].size - np.count_nonzero(self.UE_buffer[:, ue_id]) != 0: # The buffer is not full (5 - 目前 UE 對應的 Queue 中的封包個數)
+                    buf_ind = np.where(self.UE_buffer[:, ue_id] == 0)[0][0]  # buffer index 從 0 開始找到第一個為空的地方，將封包產生在這
+                    
+                    # 依照 UE 隸屬的網路切片規則來產生封包
                     if self.UE_cat[ue_id] == 'volte':
-                        self.UE_buffer[buf_ind,ue_id] = 40 * 8
-                        self.UE_readtime[ue_id] = np.random.uniform(0,160 * 10 ** (-3),1)
+                        self.UE_buffer[buf_ind, ue_id] = 40 * 8  # 產生一個大小為 320bits 的封包放到剛剛的找到的空位
+                        self.UE_readtime[ue_id] = np.random.uniform(0,160 * 10 ** (-3), 1)  # 每次產生完封包之後都會再隨機產生 readtime
+
                     elif self.UE_cat[ue_id] == 'embb_general':
-                        tmp_buffer_size = np.random.pareto(1.2,1) * 800 
-                        if tmp_buffer_size > 2000:
+                        tmp_buffer_size = np.random.pareto(1.2, 1) * 800  # 產生 800 bits 為 base 的 Pareto 分布的封包大小
+                        if tmp_buffer_size > 2000:  # 封包大小至多 2000 bits，超過就改成 2000 bits
                             tmp_buffer_size = 2000
                         # tmp_buffer_size = np.random.choice([1*8*10**6, 2*8*10**6, 3*8*10**6, 4*8*10**6, 5*8*10**6])
-                        self.UE_buffer[buf_ind,ue_id] = tmp_buffer_size
-                        self.UE_readtime[ue_id] = np.random.pareto(1.2,[1,1]) * 6 * 10 ** -3
+                        self.UE_buffer[buf_ind, ue_id] = tmp_buffer_size
+                        # 再產生一次 readtime
+                        self.UE_readtime[ue_id] = np.random.pareto(1.2, [1, 1]) * 6 * 10 ** -3  
                         if self.UE_readtime[ue_id] > 12.5 * 10 ** -3:
                             self.UE_readtime[ue_id] = 12.5 * 10 ** -3 
+
                     elif self.UE_cat[ue_id] == 'urllc':
                         #tmp_buffer_size = np.random.lognormal(14.45,0.35,[1,1])
                         # if tmp_buffer_size > 5 * 10 **6:
                         #      tmp_buffer_size > 5 * 10 **6
                         # tmp_buffer_size = np.random.choice([6.4*8*10**3, 12.8*8*10**3, 19.2*8*10**3, 25.6*8*10**3, 32*8*10**3])
-                        tmp_buffer_size = np.random.choice([0.3*8*10**6, 0.4*8*10**6, 0.5*8*10**6, 0.6*8*10**6, 0.7*8*10**6])
+                        tmp_buffer_size = np.random.choice([0.3*8*10**6, 0.4*8*10**6, 0.5*8*10**6, 0.6*8*10**6, 0.7*8*10**6])  # buffer_size 介於 0.3 ~ 0.7M bits
                         self.UE_buffer[buf_ind,ue_id] = tmp_buffer_size
-                        self.UE_readtime[ue_id]  = np.random.exponential(180* 10 ** -3,[1,1]) # read time is determines much smaller; the spec shows the average time is 180s, but here it is defined as 180 ms
-                    self.tx_pkt_no[self.ser_cat.index(self.UE_cat[ue_id])] += 1
-                    self.UE_buffer_backup[buf_ind,ue_id] = self.UE_buffer[buf_ind,ue_id]
+                        # 再產生一個 readtime
+                        self.UE_readtime[ue_id]  = np.random.exponential(180* 10 ** -3, [1, 1])
+
+                    self.tx_pkt_no[self.ser_cat.index(self.UE_cat[ue_id])] += 1  # 將記錄 learning window 中總封包總數的計數器 (tx_pkt_no) + 1
+                    self.UE_buffer_backup[buf_ind, ue_id] = self.UE_buffer[buf_ind, ue_id]  # 產生完新封包後馬上備份 UE_buffer 到 UE_buffer_backup
                     
-            else:
+            else:  # 還沒到 readtime，扣掉 timeslot
                 self.UE_readtime[ue_id] -= self.time_subframe
         
         # 每個 timeslot 後更新一次系統時間
@@ -361,10 +378,11 @@ class cellularEnv(object):
         # 此外，累加之前的 (同一個 Learning window 的)
         self.sys_se_per_frame += sys_rate_frame / self.band_whole
 
-        # 每個 UE 成功傳送封包的次數 (成功的標準取決於該 UE 使用的網路切片)
+        # 原本應該是要處理計算 latency 時的延遲
         handling_latency = 2 * 10 ** (-3)
         handling_latency = 0
 
+        # 每個 UE 成功傳送封包的次數 (成功的標準取決於該 UE 使用的網路切片)
         for ue_id in range(self.UE_max_no):  # 一次考慮一個 UE
             for i in range(self.UE_latency[:, ue_id].size):  # 考慮對應到 ue_id 的 UE 的 Queue 的所有封包 (i 是封包的 index)
                 if (self.UE_buffer[i, ue_id] == 0) & (self.UE_latency[i, ue_id] != 0):  # 考慮已經傳完的封包的 latency
@@ -376,7 +394,8 @@ class cellularEnv(object):
                             if (rate[ue_id] >= 51 * 10 ** 3) & (self.UE_latency[i, ue_id] < 10 * 10 **(-3) - handling_latency): 
                                 self.succ_tx_pkt_no[cat_index] += 1  # succ_tx_pkt_n[i] : 網路切片 i 成功傳出的封包總數
                         else:  # 封包用不只一個 timeslot 才傳完
-                            # buffer_backup 為一開始 UE_buffer.copy，目的是要記錄封包的初始大小
+                            # buffer_backup 為一開始 UE_buffer.copy，記錄著封包的初始大小
+                            # 由封包原始大小 / latency (即傳輸的時間) 得到該封包的資料傳輸速率
                             if (self.UE_buffer_backup[i,ue_id] / self.UE_latency[i, ue_id] >= 51 * 10 ** 3) & (self.UE_latency[i, ue_id] < 10 * 10 **(-3) - handling_latency):
                                 self.succ_tx_pkt_no[cat_index] += 1
                     
@@ -387,6 +406,7 @@ class cellularEnv(object):
                             if (rate[ue_id] >= 100 * 10 ** 6) & (self.UE_latency[i, ue_id] < 10 * 10 **(-3) - handling_latency):
                                 self.succ_tx_pkt_no[cat_index] += 1
                         else: # 封包用不只一個 timeslot 才傳完
+                            # rate 的部分 : 該封包的大小
                             if (self.UE_buffer_backup[i, ue_id] / self.UE_latency[i, ue_id] >= 100 * 10 ** 6) & (self.UE_latency[i, ue_id] < 10 * 10 **(-3) - handling_latency):
                                 self.succ_tx_pkt_no[cat_index] += 1
                     
@@ -416,7 +436,8 @@ class cellularEnv(object):
         return reward, se_total
 
     #=======================================================================================================================================#
-    # 
+    # 於每個 timeslot 結束後依照 UE_buffer 清理 UE_buffer_backup & UE_latency
+    # 沒傳完的封包會繼續存在 buffer 中。這邊主要是要清掉已經傳完的封包的 latency & 其 backup
     def bufferClear(self):  # UE_latency.shape = (Queue_max, UE_max_no)
         latency = np.sum(self.UE_latency, axis = 0)  # latency.shape(UE_max_no) : 每個 UE 對應的 Queue 內的封包的 Latency 總和
         UE_index = np.where(latency != 0)  # 只要有任一封包的 Latency 不為 0 則該 UE 的 index 會被記錄於 UE_index
@@ -424,27 +445,32 @@ class cellularEnv(object):
         for ue_id in UE_index[0]:  # 一次考慮一個 Latency 不為 0 的 UE
             
             # 備份，避免改到原始物件。
-            buffer_ = self.UE_buffer[:, ue_id].copy()  # 對應於 ue_id 的 UE 的 Queue (shape = Queue_max (5))
-            buffer_bk = self.UE_buffer_backup[:, ue_id].copy()  # 
-            latency_ = self.UE_latency[:, ue_id].copy()  # 對應於 ue_id 的 UE 的 Queue 中封包的 Latency (shape = Queue_max (5))
+            buffer_ = self.UE_buffer[:, ue_id].copy()  # UE_buffer 的備份，即對應於 ue_id 的 UE 的 Queue (shape = Queue_max (5))
+            buffer_bk = self.UE_buffer_backup[:, ue_id].copy()  # buffer_backup 的備份
+            latency_ = self.UE_latency[:, ue_id].copy()  # UE_latency 的備份，即對應於 ue_id 的 UE 的 Queue 中封包的 Latency (shape = Queue_max (5))
             
-            ind_1 = np.where(np.logical_and(buffer_ ==0, latency_ !=0 ) )
+            # 處理封包已經傳完，但 latency 還沒清掉的情況
+            ind_1 = np.where(np.logical_and(buffer_ == 0, latency_ != 0))   # ind_1 : 封包已經為 0 但 latency != 0 的封包所在 index
             indSize_1 = ind_1[0].size
             if indSize_1 != 0:
-                self.UE_latency[ind_1,ue_id] = np.zeros(indSize_1)
-                self.UE_buffer_backup[ind_1,ue_id] = np.zeros(indSize_1)
+                self.UE_latency[ind_1, ue_id] = np.zeros(indSize_1) # 把那些位置的 latency 清為 0
+                self.UE_buffer_backup[ind_1, ue_id] = np.zeros(indSize_1)  # 那些位置對應的 backup 的位置清為 0
 
-  
-            ind = np.where(np.logical_and(buffer_ !=0 , latency_ !=0 ) )
-            ind = ind[0]
-            indSize = ind.size 
+            # 封包還沒傳完，latency 也 != 0 的情況，東西留到下一個 timeslot
+            # 把還沒傳完的封包的大小、latency、backup 全都往前移，讓空的在 Queue 的最後面
+            ind = np.where(np.logical_and(buffer_ != 0, latency_ != 0))  # ind : 封包大小和 latency 皆不為 0 的封包所在 index
+            ind = ind[0]  # "只要那 5 格中的其中幾格" 這個資訊就好
+            indSize = ind.size
             if indSize != 0:
-                self.UE_buffer[:,ue_id] = np.zeros(bufSize)
-                self.UE_latency[:,ue_id] = np.zeros(bufSize)
-                self.UE_buffer_backup[:,ue_id] = np.zeros(bufSize)
-                self.UE_buffer[:indSize,ue_id] = buffer_[ind]
-                self.UE_latency[:indSize,ue_id] = latency_[ind]
-                self.UE_buffer_backup[:indSize,ue_id] = buffer_bk[ind]
+                # 全部清 0
+                self.UE_buffer[:, ue_id] = np.zeros(bufSize)
+                self.UE_latency[:, ue_id] = np.zeros(bufSize)
+                self.UE_buffer_backup[:, ue_id] = np.zeros(bufSize)
+                
+                # 從 0 開始放東西，根據前面得知的有東西的 index (ind) 來把還沒傳完的封包往前移
+                self.UE_buffer[:indSize, ue_id] = buffer_[ind]  # [:indSize] 就是從 0 ~ indSize
+                self.UE_latency[:indSize, ue_id] = latency_[ind]
+                self.UE_buffer_backup[:indSize, ue_id] = buffer_bk[ind]
 
     #=======================================================================================================================================#   
     # 在每個 Learning window 結束後重置計數器      
