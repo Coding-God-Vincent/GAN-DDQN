@@ -27,35 +27,40 @@ from utils.utils import initialize_weights
 # 建立 Generator 網路
 class Generator(nn.Module):
     def __init__(self, state_size, num_actions, num_samples, embedding_dim):
-        super(Generator, self).__init__()
-        
-        self.state_size = state_size # input_shape --> num_channels * hight * width 
-        self.num_actions = num_actions
-        self.num_samples = num_samples
-        self.embedding_dim = embedding_dim
+        super(Generator, self).__init__()  # same as super().__init__()
+        self.state_size = state_size  # len(ser_cat)
+        self.num_actions = num_actions  # |Action Space|
+        self.num_samples = num_samples  # 每個 Q 值機率分布的 particles 數量
+        self.embedding_dim = embedding_dim  # quantile vector 的向量維度 (N)
+
+        # 將模型直接建在 GPU
         # self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device('cuda')
-
-        self.embed_layer_1 = nn.Linear(self.state_size, self.embedding_dim)
-        # self.embed_layer_drop_1 = nn.Dropout(0.5)
+        
+        # 設定 Embedding Layer (兩個的輸出維度皆為 N，一定要一樣長，因為要做 Hadamard Product)
+        self.embed_layer_1 = nn.Linear(self.state_size, self.embedding_dim)  
+        # self.embed_layer_drop_1 = nn.Dropout(p = 0.5)  # 防止 overfitting，每次 forward propagation 的時候隨機將輸入中的美個神經元以機率 p 設為 0
         self.embed_layer_2 = nn.Linear(self.embedding_dim, self.embedding_dim)
-        # self.embed_layer_drop_2 = nn.Dropout(0.5)
-
+        # self.embed_layer_drop_2 = nn.Dropout(p = 0.5)
+        
+        # 設定 Particle Generation Component 的 Layer
+        # Hadamard Product (N, N) -> N (embedding_dim)，故 fc1.in_features = N
         self.fc1 = nn.Linear(self.embedding_dim, 256)
-        self.drop1 = nn.Dropout(0.5)
+        self.drop1 = nn.Dropout(p = 0.5)  # forward 那邊也沒用，可能效果不好
         self.fc2 = nn.Linear(256, 128)
-        self.drop2 = nn.Dropout(0.5)
-        self.fc3 = nn.Linear(128, self.num_actions)
+        self.drop2 = nn.Dropout(p = 0.5)
+        self.fc3 = nn.Linear(128, self.num_actions)  # out_features = |Action_Space| 組 Q 值機率分布，shape = (|Action_Space|, num_samples (一個 Q 值的 sample 數))
 
-        initialize_weights(self)
+        initialize_weights(self)  # 初始化各層參數 (寫在 utiils.py)
 
+    # 上面 __init__() 中的參數是在創建模型是要輸入的，這邊的 forward() 中的參數是在進行 forward Propagation 時要輸入的，常寫成 model("state")。
     def forward(self, x, tau):   # tau: torch.randn(self.batch_size, self.num_samples)
         state_tile = x.repeat(1, self.num_samples)    # [self.batch_size, (self.state_size * self.num_samples)]
         state_reshape = state_tile.view(-1, self.state_size)   
-        state = F.relu(self.embed_layer_1(state_reshape))       # [(self.batch_size * self.num_samples), self.embedding_dim]
+        state = F.relu(self.embed_layer_1(state_reshape))  # [(self.batch_size * self.num_samples), self.embedding_dim]
         # state = self.embed_layer_drop_1(state)
 
-        tau = tau.view(-1, 1)
+        tau = tau.view(-1, 1)  # 效果同 tau = tau.reshape(-1, 1)，即把 tau 的 shape 從 (len(shape)) 變成 (len(shape), 1)
         pi_mtx = torch.from_numpy(np.expand_dims(np.pi * np.arange(0, self.embedding_dim), axis=0)).to(torch.float).to(self.device)
         cos_tau = torch.cos(torch.matmul(tau, pi_mtx)) # [(self.batch_size * self.num_samples), self.embedding_dim]
         pi = F.relu(self.embed_layer_2(cos_tau))  # [(self.batch_size * self.num_samples), self.embedding_dim]
@@ -99,7 +104,7 @@ class Discriminator(nn.Module):
 
 #=============================================================================================================================================#
 # 做線性衰弱，用於控制 ɛ-greedy
-class LinearSchedule(object): 
+class LinearSchedule(object):  # 沒繼承還寫上 "Object" -> 這是舊式寫法，效果同 Class LinearSchedule():
     def __init__(self, schedule_timesteps, start_timesteps, final_p, initial_p=1.0):
         """Linear interpolation between initial_p and final_p over
         schedule_timesteps. After this many timesteps pass final_p is
