@@ -22,8 +22,9 @@ from utils.ReplayMemory import ExperienceReplayMemory, PrioritizedReplayMemory
 # from utils.wrappers import *
 from utils.utils import initialize_weights
 
-
+#=============================================================================================================================================#
 #%%  # 就像 Ipynb 一樣的功能，把程式碼切成一個一個的 Cell
+# 建立 Generator 網路
 class Generator(nn.Module):
     def __init__(self, state_size, num_actions, num_samples, embedding_dim):
         super(Generator, self).__init__()
@@ -70,8 +71,10 @@ class Generator(nn.Module):
         net = torch.transpose(x.view(-1, self.num_samples, self.num_actions), 1, 2)  # [self.batch_size, self.num_actions, self.num_samples]
         
         return net
-    
-#%%  
+
+#=============================================================================================================================================# 
+#%%
+# 建立 Disciminator 網路  
 class Discriminator(nn.Module):
     def __init__(self, num_samples, num_outputs):
         super(Discriminator, self).__init__()
@@ -94,6 +97,7 @@ class Discriminator(nn.Module):
 
         return out
 
+#=============================================================================================================================================#
 # 做線性衰弱，用於控制 ɛ-greedy
 class LinearSchedule(object): 
     def __init__(self, schedule_timesteps, start_timesteps, final_p, initial_p=1.0):
@@ -124,6 +128,7 @@ class LinearSchedule(object):
             fraction = min(float(t) / (self.schedule_timesteps + self.start_timesteps), 1.0)
             return self.initial_p + fraction * (self.final_p - self.initial_p)
 
+#=============================================================================================================================================#
 class WGAN_GP_Agent(object):
     def __init__(self, static_policy, num_input, num_actions):
         super(WGAN_GP_Agent, self).__init__()
@@ -366,7 +371,9 @@ class WGAN_GP_Agent(object):
         print('current q value', current_q_values_samples.mean(1))
         print('expected q value', expected_q_values_samples.mean(1))
 
-    
+
+#=============================================================================================================================================#
+# 回傳一個 WGAN-GP 的 Action Space : list
 def action_space(total, num):  # total = 10 (total_band = 10MHz)，num = 3 (3 types of NS)
     tmp = list(itertools.product(range(total + 1), repeat=num))  # itertools.product() : 產出所有 0~10 中取 3 個數字的所有組合。將 (x, y, z) 存入 tmp
     result = []
@@ -387,15 +394,23 @@ def action_space(total, num):  # total = 10 (total_band = 10MHz)，num = 3 (3 ty
 
     return result  # x + y + z = 10，且任一不為 0
 
-def state_update(state, ser_cat):
+#=============================================================================================================================================#
+# 進入神經網路前的狀態前處理，將 state 中的值做正規化，使整個 state 各元素的均值為 0、標準差為 1
+def state_update(state, ser_cat):  # state : 當前 timeslot 各網路切片要傳送的封包個數 [d0, d1, d2]
     discrete_state = np.zeros(state.shape)
-    if state.all() == 0:
+
+    # 若 state 內皆為 0，則不用進行前處理，輸入的狀態為一個零矩陣
+    if state.all() == 0:  # all() 回傳一個 bool，true -> 內部皆非 0，false -> 內部皆為 0
         return discrete_state
-    for ser_name in ser_cat:
+    # 若 state 內有任一不為 0，則需做正規化
+    for ser_name in ser_cat:  # 一次考慮一種網路切片
         ser_index = ser_cat.index(ser_name)
         discrete_state[ser_index] = state[ser_index]
-    discrete_state = (discrete_state-discrete_state.mean())/discrete_state.std()
+    discrete_state = (discrete_state - discrete_state.mean()) / discrete_state.std()  # 對整個 state 做 z-score 正規化
     return discrete_state
+
+#=============================================================================================================================================#
+# Reward function，有做 reward clipping
 
 # def calc_reward(qoe, se, low, high):
 #     utility = np.matmul(qoe_weight, qoe.reshape((3, 1))) + se_weight * se
@@ -406,25 +421,40 @@ def state_update(state, ser_cat):
 #     else:
 #         reward = 0
 #     return utility, reward
+
+# qoe -> 三種網路切片在整個 learning window 的 SSR
+# se  -> 整個 learning window 中的平均每個 timeslot 的 SE
+# threshold -> 當前 timeslot 對模型的利用率要求，會隨時間單調上升
 def calc_reward(qoe, se, threshold):
-    utility = np.matmul(qoe_weight, qoe.reshape((3, 1))) + se_weight * se
+    # 依照權重算出 utility
+    utility = np.matmul(qoe_weight, qoe.reshape((3, 1))) + se_weight * se 
+    
+    # 這演算法的 threshold 是會隨時間而單調上升的，故要限制 threshold
+    # threshold = 3.5 + 1.5 * frame / (total_timesteps / 1.5)
     if threshold > 5.5:
         threshold = 5.5
+
+    # reward clipping
     if utility < threshold:
         reward = 0
     else:
         reward = 1
     return utility, reward
 
+#=============================================================================================================================================#
+# WGAN-GP 的 Generator (G_model) 選擇動作 by ɛ-greedy
+# model -> 網路、s -> state (已經過前面的 state_update 狀態前處理，(3))、z -> quantile embedding (tau 組成的 vector)、eps -> epsilon
 def get_action(model, s, z, eps, device):
     if np.random.random() >= eps:
+        # X.shape (1, 3)
         X = torch.tensor(s).unsqueeze(0).to(torch.float).to(device)
         a = model.G_model(X, z).squeeze(0).mean(1).max(0)[1]
         # print(a)  
-        return a.item()
+        return a.item()  # from tensor to aboriginal python data type
     else:
         return np.random.randint(0, model.num_actions)
 
+#=============================================================================================================================================#
 def plot_rewards(rewards):
     plt.figure(1)
     plt.clf()
@@ -435,6 +465,8 @@ def plot_rewards(rewards):
     plt.plot(rewards.cumsum())
     plt.pause(0.001)
 
+#=============================================================================================================================================#
+# 訓練過程
 
 # torch.cuda.manual_seed(100)
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
