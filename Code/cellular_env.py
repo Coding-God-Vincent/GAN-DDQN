@@ -13,6 +13,7 @@ import numpy as np
 import time
 
 class cellularEnv(object):
+    # __init__() 括號中的值都有 assign，這些 assign 的值是預設值，若在實例化的時候有傳入值進來會以實例化傳的值為主
     def __init__(self,
                  
         # Base Station Position & Area
@@ -65,7 +66,7 @@ class cellularEnv(object):
         # RL 的學習視窗，即學習一次會經過幾個 time_subframes (以 time_subframes 為單位)
         # 可以得出一次訓練會要 60000 * 0.5ms = 30s
         learning_windows = 60000,
-        ):
+    ):
 
         self.BS_tx_power = BS_tx_power
         self.BS_radius = BS_radius
@@ -106,10 +107,10 @@ class cellularEnv(object):
         
         # 根據 3GPP TR 36.814 的 path loss model (dis.unit = km)
         # 回傳一個 shape 是 (UE_max_no, 1) 的 np.array，每一格都代表該 UE 的 path loss
-        self.path_loss = 145.4 + 37.5 * np.log10(dis).reshape(-1,1)
+        self.path_loss = 145.4 + 37.5 * np.log10(dis).reshape(-1, 1)
 
         # RL 學習視窗，以 s 為單位，這邊可以推得就是 60000 * 0.0005 = 30s。代表一每 30s 更新一次參數
-        self.learning_windows = round(learning_windows*self.time_subframe,4)
+        self.learning_windows = round(learning_windows * self.time_subframe, 4)
 
         self.ser_cat = ser_cat
         if len(self.ser_cat) > 1:
@@ -123,10 +124,10 @@ class cellularEnv(object):
             self.band_ser_cat = self.band_whole
         
         # 依照前面的機率分布產生各 UE 要使用的網路切片種類，shape : (UE_max_no)
-        self.UE_cat = np.random.choice(self.ser_cat, self.UE_max_no, p=self.ser_prob) #TBD
+        self.UE_cat = np.random.choice(self.ser_cat, self.UE_max_no, p=self.ser_prob)
 
         # tx_pkt_no 為每個類型網路切片成功傳輸的封包數的計數器，唯一個長度為 3 的 np.ndarray
-        self.tx_pkt_no = np.zeros(len(self.ser_cat))        
+        self.tx_pkt_no = np.zeros(len(self.ser_cat))
 
     #=======================================================================================================================================#
     # 通道模型 (只考慮大尺度衰弱 (考慮 path loss 和 shadow fading)) : 會得出每一個 UE 的通道狀況 (chan_loss, shape = (UE_max_no, 1))。 unit : dB

@@ -16,16 +16,16 @@ class ExperienceReplayMemory:
     def push(self, transition):
         self.memory.append(transition)
         if len(self.memory) > self.capacity:
-            del self.memory[0]
+            del self.memory[0]  # 刪除第 0 筆資料
 
     def shuffle_memory(self):
         return np.random.permutation(self.memory)
 
     def random_sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
+        return random.sample(self.memory, batch_size)  # 不會抽出重複的樣本
 
     def determine_sample(self, prev_t, t):
-        return self.memory[prev_t:t]
+        return self.memory[prev_t: t]
 
     def __len__(self):
         return len(self.memory)

@@ -1,3 +1,9 @@
+'''
+* 這邊的對模型輸入輸出的註解都是以 batch 的角度在寫，但其實這種 batch 的操作模型會自動做，所以可以看到在程式的寫法中都沒有考慮 batch，只考慮單一狀態的輸入。
+
+
+'''
+
 import torch, time, os, pickle, glob, math, json
 import numpy as np
 import csv
@@ -5,6 +11,7 @@ from timeit import default_timer as timer
 from datetime import timedelta
 import itertools
 import pandas as pd
+from tqdm.auto import tqdm
 
 # simulation environment
 from cellular_env import cellularEnv
@@ -25,11 +32,12 @@ from utils.utils import initialize_weights
 #=============================================================================================================================================#
 #%%  # 就像 Ipynb 一樣的功能，把程式碼切成一個一個的 Cell
 # 建立 Generator 網路
+# 將狀態、Quantiles 向量傳入後輸出所有 Q 值的機率分布 (|A| * num_samples 個 particles，對應 |A| 個 Q 值機率分布)
 class Generator(nn.Module):
     def __init__(self, state_size, num_actions, num_samples, embedding_dim):
         super(Generator, self).__init__()  # same as super().__init__()
         self.state_size = state_size  # len(ser_cat)
-        self.num_actions = num_actions  # |Action Space|
+        self.num_actions = num_actions  # |Action_Space|
         self.num_samples = num_samples  # 每個 Q 值機率分布的 particles 數量
         self.embedding_dim = embedding_dim  # quantile vector 的向量維度 (N)
 
@@ -49,87 +57,92 @@ class Generator(nn.Module):
         self.drop1 = nn.Dropout(p = 0.5)  # forward 那邊也沒用，可能效果不好
         self.fc2 = nn.Linear(256, 128)
         self.drop2 = nn.Dropout(p = 0.5)
-        self.fc3 = nn.Linear(128, self.num_actions)  # out_features = |Action_Space| 組 Q 值機率分布，shape = (|Action_Space|, num_samples (一個 Q 值的 sample 數))
+        self.fc3 = nn.Linear(128, self.num_actions)  # out_shape = |Action_Space|
 
         initialize_weights(self)  # 初始化各層參數 (寫在 utiils.py)
 
     # 上面 __init__() 中的參數是在創建模型是要輸入的，這邊的 forward() 中的參數是在進行 forward Propagation 時要輸入的，常寫成 model("state")。
-    def forward(self, x, tau):   # tau: torch.randn(self.batch_size, self.num_samples)
-        state_tile = x.repeat(1, self.num_samples)    # [self.batch_size, (self.state_size * self.num_samples)]
-        state_reshape = state_tile.view(-1, self.state_size)   
-        state = F.relu(self.embed_layer_1(state_reshape))  # [(self.batch_size * self.num_samples), self.embedding_dim]
+    def forward(self, x, tau):   # tau : quantiles vector = torch.randn(self.batch_size * self.num_samples)
+        
+        # 分別對 State & quantiles 經過 embedding layer 
+        state_tile = x.repeat(1, self.num_samples)  # 將 state 複製 self.num_samples 次，其 shape = [self.batch_size, (self.state_size * self.num_samples)]
+        state_reshape = state_tile.view(-1, self.state_size)  # shape : [(self.batch_size * self.num_samples), self.state_size]
+        state = F.relu(self.embed_layer_1(state_reshape))  # shape : [(self.batch_size * self.num_samples), self.embedding_dim]
         # state = self.embed_layer_drop_1(state)
 
-        tau = tau.view(-1, 1)  # 效果同 tau = tau.reshape(-1, 1)，即把 tau 的 shape 從 (len(shape)) 變成 (len(shape), 1)
+        # 設定 quantile vector，做了這麼多而非直接使用原始 tau 是為了讓模型捕捉到不同的 tau 要輸出不同的 Q 值
+        # 將傳入的 tau (隨機產生的) 進行 reshape
+        tau = tau.view(-1, 1)  # 效果同 tau = tau.reshape(-1, 1)，即把 tau 的 shape 從 (self.batch_size * self.num_samples) 變成 (原本的 shape, 1)
+        # 回傳一個 (1, embedding_dim) 的 np.ndarray。
+        # np.expand_dims("array", "axis") : 在指定 axis 新增一個維度。ex : np.expand_dims([1, 2, 3], 0).shape -> [1, 3]
         pi_mtx = torch.from_numpy(np.expand_dims(np.pi * np.arange(0, self.embedding_dim), axis=0)).to(torch.float).to(self.device)
-        cos_tau = torch.cos(torch.matmul(tau, pi_mtx)) # [(self.batch_size * self.num_samples), self.embedding_dim]
-        pi = F.relu(self.embed_layer_2(cos_tau))  # [(self.batch_size * self.num_samples), self.embedding_dim]
+        # 做 cosine basis encoding，類似 Transformer 中的 position encoding，引入不同頻率的週期性資訊。
+        # 由此能讓模型把 quantile 映射到更高維、非線性的空間
+        cos_tau = torch.cos(torch.matmul(tau, pi_mtx)) #  shape : [(self.batch_size * self.num_samples), self.embedding_dim]
+        # 將處理過的 quantile 經過 embedding layer (relu) 抽取特徵。
+        pi = F.relu(self.embed_layer_2(cos_tau))  # shape : [(self.batch_size * self.num_samples), self.embedding_dim]
         # pi = self.embed_layer_drop_2(pi)
 
-        x = state * pi
-        x = F.relu(self.fc1(x))
-        # x = self.drop1(x)
-        x = F.relu(self.fc2(x))
-        # x = self.drop2(x)
-        x = self.fc3(x)    # [(self.batch_size * self.num_samples), self.num_actions]
-
-        net = torch.transpose(x.view(-1, self.num_samples, self.num_actions), 1, 2)  # [self.batch_size, self.num_actions, self.num_samples]
+        # Hadamard Product (shape 相同的 np 矩陣相乘會做對應項相乘 (Hadamard))
+        x = state * pi  # shape : [(self.batch_size * self.num_samples), self.embedding_dim]
         
+        # Particle Generation Component
+        x = F.relu(self.fc1(x))  # shape : [(self.batch_size * self.num_samples), 256]
+        # x = self.drop1(x)  
+        x = F.relu(self.fc2(x))  # shape : [(self.batch_size * self.num_samples), 128]
+        # x = self.drop2(x)
+        x = self.fc3(x)  # shape : [(self.batch_size * self.num_samples), self.num_actions]
+
+        # x.view() : shape from [(self.batch_size * self.num_samples), self.num_actions] -> [self.batch_size, self.num_samples, self.num_actions]
+        # transpose : shape from [self.batch_size, self.num_samples, self.num_actions] -> [self.batch_size, self.num_actions, self.num_samples]
+        net = torch.transpose(x.view(-1, self.num_samples, self.num_actions), 1, 2)  # [self.batch_size, self.num_actions, self.num_samples]
         return net
 
 #=============================================================================================================================================# 
 #%%
 # 建立 Disciminator 網路  
+# input_shape : [self.batch_size, self.num_actions, self.num_samples]
+# output_shape : [self.batch_size, self.num_actions, self.num_outputs]
 class Discriminator(nn.Module):
-    def __init__(self, num_samples, num_outputs):
+    def __init__(self, num_samples, num_outputs):  # num_output = 1
         super(Discriminator, self).__init__()
-
         self.num_inputs = num_samples
         self.num_outputs = num_outputs
-
         self.fc1 = nn.Linear(self.num_inputs, 512)
         self.fc2 = nn.Linear(512, 512)
         self.fc3 = nn.Linear(512, self.num_outputs)
-
         initialize_weights(self)
 
     def forward(self, x, z):
         # add little noise
+        # z = 0. * torch.randn(self.batch_size, self.num_samples).to(self.device) = 0
+        # 所以其實沒有加上 noise
         x = x + z
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         out = self.fc3(x)
-
         return out
 
 #=============================================================================================================================================#
-# 做線性衰弱，用於控制 ɛ-greedy
+# 到 start_timestep 之後開始做線性衰弱 (Linear Schedule)，用於控制 ɛ-greedy
+# schedule_timesteps : 從 init_p 到 final_p 所需的時間步數
 class LinearSchedule(object):  # 沒繼承還寫上 "Object" -> 這是舊式寫法，效果同 Class LinearSchedule():
-    def __init__(self, schedule_timesteps, start_timesteps, final_p, initial_p=1.0):
-        """Linear interpolation between initial_p and final_p over
+    def __init__(self, schedule_timesteps, start_timesteps, final_p, initial_p = 1.0):
+        '''
+        Linear interpolation between initial_p and final_p over
         schedule_timesteps. After this many timesteps pass final_p is
         returned.
-
-        Parameters
-        ----------
-        schedule_timesteps: int
-            Number of timesteps for which to linearly anneal initial_p
-            to final_p
-        initial_p: float
-            initial output value
-        final_p: float
-            final output value
-        """
+        '''
         self.schedule_timesteps = schedule_timesteps
         self.start_timesteps = start_timesteps
         self.final_p = final_p
         self.initial_p = initial_p
 
-    def value(self, t):
-        """See Schedule.value"""
+    def value(self, t):  # t 為當前 timestep
         if t < self.start_timesteps:
             return self.initial_p
-        else:
+        else:  # 開始做線性衰弱
+            # fraction 隨時間步增大
             fraction = min(float(t) / (self.schedule_timesteps + self.start_timesteps), 1.0)
             return self.initial_p + fraction * (self.final_p - self.initial_p)
 
@@ -137,40 +150,43 @@ class LinearSchedule(object):  # 沒繼承還寫上 "Object" -> 這是舊式寫�
 class WGAN_GP_Agent(object):
     def __init__(self, static_policy, num_input, num_actions):
         super(WGAN_GP_Agent, self).__init__()
-        # parameters
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # device
         self.device = torch.device('cuda')
 
+        # parameters
         self.gamma = 0.75
         self.lr_G = 1e-4
         self.lr_D = 1e-4
-        self.target_net_update_freq = 10
+        self.target_net_update_freq = 10  # target_G 參數逼近 G (instead of sync.) every 10 steps
         self.experience_replay_size = 2000
         self.batch_size = 32
-        self.update_freq = 200
-        self.learn_start = 0
-        self.tau = 0.1                        # default is 0.005
-
-        self.static_policy = False
-        self.num_feats = num_input
-        self.num_actions = num_actions
-        self.z_dim = 32
-        self.num_samples = 32
-
-        self.lambda_ = 10
-        self.n_critic = 5  # the number of iterations of the critic per generator iteration1
+        self.update_freq = 200  # update WGAN_GP every 200 steps (updates 60000/200 = 300 in 1 learning window)
+        # 而每次 update() 都會更新 62 次 (D 更新 62 * n_critic，G 更新 62 * n_gen(1) 次)
+        self.learn_start = 0  # 從第幾步開始允許模型開始更新參數
+        self.tau = 0.1  # default is 0.005 (不是 G 使用的 tau，是 Target_G 逼近 G 時使用的)
+        self.static_policy = False  # True -> evaluation，False -> train
+        self.num_feats = num_input  # state_size
+        self.num_actions = num_actions  # |Action_space|
+        self.z_dim = 32  # len(quantile vector)
+        self.num_samples = 32  # samples in 1 Q-value distribution
+        self.lambda_ = 10  # Gradient Penalty 的 lambda
+        self.n_critic = 5  # 訓練一次 G 會之前會先訓練 5 次 D
         self.n_gen = 1
 
+        # model
+        # 創建網路 (G_model, G_target_model, D_model)
         self.declare_networks()
-
         self.G_target_model.load_state_dict(self.G_model.state_dict())
-        self.G_optimizer = optim.Adam(self.G_model.parameters(), lr=self.lr_G, betas=(0.5, 0.999))
-        self.D_optimizer = optim.Adam(self.D_model.parameters(), lr=self.lr_D, betas=(0.5, 0.999))
-
+        # set optimizer
+        # betas((0.5, 0.999)) -> (一階動量保持多少比例的梯度, 二階動量保持多少比例的梯度) 參考 DCGAN 的建議
+        self.G_optimizer = optim.Adam(self.G_model.parameters(), lr = self.lr_G, betas = (0.5, 0.999))
+        self.D_optimizer = optim.Adam(self.D_model.parameters(), lr = self.lr_D, betas = (0.5, 0.999))
+        # device
         self.G_model = self.G_model.to(self.device)
         self.G_target_model = self.G_target_model.to(self.device)
         self.D_model = self.D_model.to(self.device)
-
+        # train or test
         if self.static_policy:
             self.G_model.eval()
             self.D_model.eval()
@@ -178,47 +194,65 @@ class WGAN_GP_Agent(object):
             self.G_model.train()
             self.D_model.train()
 
-        self.update_count = 0
-        self.nsteps = 1
-        self.nstep_buffer = []
-
+        # 創建 replay buffer
         self.declare_memory()
 
+        # 紀錄訓練過程中的 loss 變化
         self.train_hist = {}
         self.train_hist['D_loss'] = []
         self.train_hist['G_loss'] = []
         
-        self.one = torch.tensor([1], device=self.device, dtype=torch.float)
+        # 創建 1 & -1 的 tensor
+        self.one = torch.tensor([1], device = self.device, dtype = torch.float)
         self.mone = self.one * -1
+        
+        self.update_count = 0  # 用來記錄目前更新的次數
+        self.nsteps = 1  # 使用 single step
+        self.nstep_buffer = []
 
+        # (這邊沒用到) 要寫的話也是 nn.BatchNorm1d(num_features).to(self.device)
+        # 使用場景：
+        # 一個資料中有 num_features 個 features。有 batch_size 筆資料
+        # 會一個一個的把每一筆資料中的第 k 號 features (共有 batch_size 個 k 號 features) 一起做正規化，k = [1, num_features]
         self.batch_normalization = nn.BatchNorm1d(self.batch_size).to(self.device)
 
+    #=====================================================================================================================================
+    # 創建網路
     def declare_networks(self):
         # Output the probability of each sample
         self.G_model = Generator(self.num_feats, self.num_actions, self.num_samples, self.z_dim) # output: batch_size x (num_actions*num_samples)
         self.G_target_model = Generator(self.num_feats, self.num_actions, self.num_samples, self.z_dim)
         self.D_model = Discriminator(self.num_samples, 1) # input: batch_size x num_samples output: batch_size
 
+    # 創建 replay buffer (list)
     def declare_memory(self):
         self.memory = ExperienceReplayMemory(self.experience_replay_size)
 
+    # push experience into replay buffer
     def append_to_replay(self, s, a, r, s_):
         self.memory.push((s, a, r, s_))
 
+    # 存模型的參數
     def save_w(self):
             if not os.path.exists('./saved_agents/GANDDQN'):
-                os.makedirs('./saved_agents/GANDDQN')
-            torch.save(self.G_model.state_dict(), './saved_agents/GANDDQN/G_model_10M_0.01.dump')
+                os.makedirs('./saved_agents/GANDDQN')  # "在當前路徑/saved_agents/GANDDQN" 創建一個資料夾 
+            # .dump 是作者取的副檔名，可以隨便取，只要讀取的時候用 torch.load 就行
+            torch.save(self.G_model.state_dict(), './saved_agents/GANDDQN/G_model_10M_0.01.dump')  # 把模型參數存在該資料夾
             torch.save(self.D_model.state_dict(), './saved_agents/GANDDQN/D_model_10M_0.01.dump')
 
+    # 存 replay buffer 中的東西
+    # pickle.dump() : 將 self.memory 序列化後將其轉為二進制存入 exp_replay_agent.dump 
+    # 'wb' : write binary，以 binary 的形式寫入
     def save_replay(self):
         pickle.dump(self.memory, open('./saved_agents/exp_replay_agent.dump', 'wb'))
 
+    # 載回之前儲存的 replay buffer
     def load_replay(self):
         fname = './saved_agents/exp_replay_agent.dump'
         if os.path.isfile(fname):
             self.memory = pickle.load(open(fname, 'rb'))
 
+    # 載回之前的模型參數
     def load_w(self):
         fname_G_model = './saved_agents/G_model_0.dump'
         fname_D_model = './saved_agents/D_model_0.dump'
@@ -230,56 +264,79 @@ class WGAN_GP_Agent(object):
         if os.path.isfile(fname_D_model):
             self.D_model.load_state_dict(torch.load(fname_D_model))
 
+    # 顯示 G、D 訓練過程的 loss 變化
     def plot_loss(self):
-        plt.figure(2)
-        plt.clf()
-        plt.title('Training loss')
+        plt.figure(2)  # 切換到 2 號 figure (若不存在會自行建立)
+        plt.clf()  # 清除 2 號 figure 裡面的東西
+        plt.title('Training loss')  
         plt.xlabel('Episode')
         plt.ylabel('Loss')
-        plt.plot(self.train_hist['G_loss'], 'r')
+        plt.plot(self.train_hist['G_loss'], 'r')  # r -> red
         plt.plot(self.train_hist['D_loss'], 'b')
-        plt.legend(['G_loss', 'D_loss'])
-        plt.pause(0.001)
+        plt.legend(['G_loss', 'D_loss'])  # 加上圖例 (對應到線的顏色)
+        plt.pause(0.001)  # 讓 figure 短暫暫停 0.001s，讓圖表即時更新和顯示
 
+    # 從 replay buffer 中取出 minibatch 的資料並依照其性質分成數個 batch 的 tensor
     def prep_minibatch(self, prev_t, t):
+        # 取出 replay buffer 中第 prev_t 到第 t 筆的資料
+        # transitions = (s, a, r, s_)
         transitions = self.memory.determine_sample(prev_t, t)
-
+        # *transition = (s1, a1, r1, s_1), (s2, a2, r2, s_2), ..., (sn, an, rn, s_n)
+        # zip(*transition) = (s1, s2, ..., sn), (a1, a2, ..., an), (r1, r2, ..., rn), (s_1, s_2, ..., s_n)
         batch_state, batch_action, batch_reward, batch_next_state = zip(*transitions)
-
         batch_state = torch.tensor(batch_state).to(torch.float).to(self.device)
         batch_action = torch.tensor(batch_action, device=self.device, dtype=torch.long).view(-1, 1)
         batch_reward = torch.tensor(batch_reward, device=self.device, dtype=torch.float).view(-1, 1)
         batch_next_state = torch.tensor(batch_next_state).to(torch.float).to(self.device)
-
         return batch_state, batch_action, batch_reward, batch_next_state
 
+    # 每 self.target_net_update_freq steps 就更新一次 G & target_G 的參數
+    # 兩個網路的參數不會馬上完全一樣，而是 target_G 會 "慢慢追上" G 的參數 (EMA, Exponential Moving Average)
     def update_target_model(self):
         self.update_count += 1
         self.update_count = self.update_count % self.target_net_update_freq
         if self.update_count == 0:
             for target_param, param in zip(self.G_target_model.parameters(), self.G_model.parameters()):
+                # EMA 更新公式 (self.tau = 0.1，追的速度，越小越穩定，越大越快追上)
                 target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
     
+    # target_Q distribution = immediate_r + gamma * max(target_Q(next_state)
+    # 這邊是在做 max 那一段，回傳的 shape : (self.batch_size, 1, self.num_samples)
     def get_max_next_state_action(self, next_states, noise):
-        samples = self.G_target_model(next_states, noise)
+        samples = self.G_target_model(next_states, noise)  # samples.shape = (self.batch_size, self.num_actions, self.num_samples)
+        # .mean(2) -> 對第二維度的值取 mean，相當於取各動作的平均 Q 值，回傳 shape 為 (self.batch_size, self.num_actions)
+        # .max(1)[1] -> 前面的 (1) 是對第一維度的值取 max，回傳 max 的 value, index。後面要的是 [1]，所以是 index。回傳 shape 為 (self.batch_size)
+        # next_state.size(0) 是取出第零維度的 size。即 size = (1, 2, 3) 的 1。
+        # view() -> 將 max 做完後的 shape (self.batch_size) 轉為 (self.batch_size, 1, 1)
+        # expand() -> 將 shape (self.batch_size, 1, 1) 轉為 (self.batch_size, 1, self.num_samples)
+        # expand() 那邊轉完 self.num_samples 是複製 self.num_samples 次
         return samples.mean(2).max(1)[1].view(next_states.size(0), 1, 1).expand(-1, -1, self.num_samples)
 
+    # 計算 GP (Gradient Penalty)
     def calc_gradient_penalty(self, real_data, fake_data, noise):
+        # 找 ε，為 real_data & fake_data 的混合比例
         alpha = torch.rand(self.batch_size, 1)
         alpha = alpha.expand(real_data.size()).to(self.device)
+        # interpolates = x_hat，即檢查點
         interpolates = alpha * real_data.data + (1 - alpha) * fake_data.data
+        # 因為後面要使用 grad() 去算其梯度
         interpolates.requires_grad = True
 
+        # 算 GP
         disc_interpolates = self.D_model(interpolates, noise)
         gradients = grad(outputs=disc_interpolates, inputs=interpolates, 
                         grad_outputs=torch.ones(disc_interpolates.size()).to(self.device),
                         create_graph=True, retain_graph=True, only_inputs=True)[0]
-
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * self.lambda_
         return gradient_penalty
 
+    # 自己控制 G & D 的學習率，隨時間遞減。不單只靠 Adam
+    # 0~2999 -> self.lr_G
+    # 3000~5999 -> 0.1 * self.lr_G
+    # 6000~8999 -> 0.01 * self.lr_G
     def adjust_G_lr(self, epoch):
         lr = self.lr_G * (0.1 ** (epoch // 3000))
+        # 更改 Optimizer 中的 lr 參數，改成自己的
         for param_group in self.G_optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -288,93 +345,118 @@ class WGAN_GP_Agent(object):
         for param_group in self.D_optimizer.param_groups:
             param_group['lr'] = lr
 
-    def update(self, frame=0):
+    # 更新 G、D 參數
+    # frame : 當前 timeslot
+    def update(self, frame = 0):
+        
+        # 若現在是測試階段就不做 update
         if self.static_policy:
             return None
-        
-        # self.append_to_replay(s, a, r, s_)
 
+        # 若現在還沒到開始學習的時間步就不做 update
         if frame < self.learn_start:
             return None
 
+        # 若還沒到更新的步數就不做 update
         if frame % self.update_freq != 0:
             return None
 
+        # 若 replay buffer 還沒滿就不做 update
         if self.memory.__len__() != self.experience_replay_size:
             return None
         
-        print('Training.........')
-
+        # 開始 update ============================================
+        
+        # 決定 G & D 的 lr
         self.adjust_G_lr(frame)
         self.adjust_D_lr(frame)
 
+        # 因為樣本不重複使用，因此切好每次要訓練的樣本範圍，將範圍 index 存入 slicing_idx
         self.memory.shuffle_memory()
         len_memory = self.memory.__len__()
         memory_idx = range(len_memory)
+        # memory_idx[::self.batch_size] -> 於 memory_idx 中每隔 self.batch_size 取一次 index
         slicing_idx = [i for i in memory_idx[::self.batch_size]]
+        # 此論文中，slicing_idx = [0, 32, 64, ..., len_memory]
         slicing_idx.append(len_memory)
-        # print(slicing_idx)
 
-        self.G_model.eval()
-        for t in range(len_memory // self.batch_size):
-            for _ in range(self.n_critic):
-                # update Discriminator
+        # update G、D 的模型參數
+        # Loss_D = E[D(G^a(s, tau))] - E[D(y^a)] + p(lambda_)
+        # Loss_G = -E[D(G^a(s, tau))]
+        self.G_model.eval()  # G 在這邊還沒要更新，所以設為 eval() 模試
+        for t in range(len_memory // self.batch_size):  # 0 ~ 61
+            # D 更新 n_critic 次才會更新 1 次 G，避免 mode collapse
+            for _ in range(self.n_critic):  # _ 意思是不重要，只要次數有到就好
+                # 取出一個 batch 的資料並依照屬性拆成數個 tensor by prep_minibatch()
                 batch_vars = self.prep_minibatch(slicing_idx[t], slicing_idx[t+1])
                 batch_state, batch_action, batch_reward, batch_next_state = batch_vars
+                # batch_action 的 shape 從 (batch_size, 1) 轉成 (batch_size, 1, 1) by unsqueeze 
+                # 再轉成 (self.batch_size, 1, self.num_samples) by expand
+                # 這樣轉 shape 是為了當作下面 gather 的 index。
+                batch_action = batch_action.unsqueeze(dim = -1).expand(-1, -1, self.num_samples)
+
+                # 取得 G 生成的 Q 值機率分布。(fake)，shape : (self.batch_size, self.num_samples)
                 G_noise = (torch.rand(self.batch_size, self.num_samples)).to(self.device)
-
-                batch_action = batch_action.unsqueeze(dim=-1).expand(-1, -1, self.num_samples)
-
-                # estimate
-                current_q_values_samples = self.G_model(batch_state, G_noise) # batch_size x (num_actions*num_samples)
+                current_q_values_samples = self.G_model(batch_state, G_noise) # output_shape : (self.batch_size, self.num_actions, self.num_samples)
+                # gather : 取出實作於環境的 Q 值的所有 particles (shape : self.batch_size, 1, self.num_samples)
+                # squeeze : shape : (self.batch_size, self.num_samples)
+                # 最後得出各筆資料實作的動作的 Q 值的所有 particles
                 current_q_values_samples = current_q_values_samples.gather(1, batch_action).squeeze(1)
 
-                # target
+                # Target Q 值機率分布。(real)，shape : (self.batch_size, self.num_samples)
+                # Target_Q = immediate_r + gamma * max{Target_Q(s_, max_a(Target_Q(s, tau)), tau)}
                 with torch.no_grad():
                     expected_q_values_samples = torch.zeros((self.batch_size, self.num_samples), device=self.device, dtype=torch.float) 
+                    # 最後取出各筆資料最大期望值的動作的 Q 值的所有 particles
                     max_next_action = self.get_max_next_state_action(batch_next_state, G_noise)
+                    # 這邊的 G_model 應改為 G_target_model 才對 *****
                     expected_q_values_samples = self.G_model(batch_next_state, G_noise).gather(1, max_next_action).squeeze(1)
                     expected_q_values_samples = batch_reward + self.gamma * expected_q_values_samples
 
+                # Loss_D = E[D(G^a(s, tau))] - E[D(y^a)] + p(lambda_)
+                # D 不用傳 noise，下面那句的 D_noise = 0
                 D_noise = 0. * torch.randn(self.batch_size, self.num_samples).to(self.device)
-                # WGAN-GP
-                self.D_model.zero_grad()
+                # E[D(y)]
                 D_real = self.D_model(expected_q_values_samples, D_noise)
-                D_real_loss = torch.mean(D_real)
-
+                D_real_loss = torch.mean(D_real)  
+                # E[D(G(s, tau))]
                 D_fake = self.D_model(current_q_values_samples, D_noise)
-                D_fake_loss = torch.mean(D_fake)
-
+                D_fake_loss = torch.mean(D_fake) # 
+                # 計算 p(lambda_) by calc_gradient_penalty()
                 gradient_penalty = self.calc_gradient_penalty(expected_q_values_samples, current_q_values_samples, D_noise)
-                
+                # 計算 Loss_D
                 D_loss = D_fake_loss - D_real_loss + gradient_penalty
-
+                # update D 的參數
+                self.D_model.zero_grad()
                 D_loss.backward()
                 self.D_optimizer.step()
 
-            # update G network
+            # Loss_G = -E[D(G^a(s, tau))]
             self.G_model.train()
-            self.G_model.zero_grad()
-
-            # estimate
-            current_q_values_samples = self.G_model(batch_state, G_noise) # batch_size x (num_actions*num_samples)
+            # 取得 G 生成的 Q 值機率分布。(fake)，shape : (self.batch_size, self.num_samples)
+            current_q_values_samples = self.G_model(batch_state, G_noise)  # 用的是 D 第五次更新所用的那個 batch
             current_q_values_samples = current_q_values_samples.gather(1, batch_action).squeeze(1)
-            
-            # WGAN-GP
+            # G^a(s, tau)
             D_fake = self.D_model(current_q_values_samples, D_noise)
+            # E[G^a(s, tau)]
             G_loss = -torch.mean(D_fake)
+            # update G 的參數
+            self.G_model.zero_grad()
             G_loss.backward()
+            # gradient clipping，將梯度限制在 (-1, 1)，防止梯度爆炸，訓練不穩定
             for param in self.G_model.parameters():
                 param.grad.data.clamp_(-1, 1)
             self.G_optimizer.step()
 
+            # 紀錄 G 和 D 這次的 loss，D 記錄的 loss 是其第五次更新時的 loss
             self.train_hist['G_loss'].append(G_loss.item())
             self.train_hist['D_loss'].append(D_loss.item())
 
+            # target_G 逼近 G 的參數 every target_net_update_freq
             self.update_target_model()
 
-        print('current q value', current_q_values_samples.mean(1))
-        print('expected q value', expected_q_values_samples.mean(1))
+        # print('current q value', current_q_values_samples.mean(1))
+        # print('expected q value', expected_q_values_samples.mean(1))
 
 
 #=============================================================================================================================================#
@@ -480,8 +562,8 @@ device = torch.device('cuda')
 # exploration_start = 0.
 total_timesteps = 10000
 # exploration_final_eps = 0.02
-#epsilon variables
 
+#epsilon variables
 epsilon_start    = 1.0
 epsilon_final    = 0.01
 epsilon_decay    = 3000
@@ -502,12 +584,12 @@ learning_window = 2000
 #                                 initial_p=1.0,
 #                                 final_p=exploration_final_eps)
 
-plt.ion()
+plt.ion()  # 開啟圖片互動模式，可以在訓練時即時更新圖片
 
-env = cellularEnv(ser_cat=ser_cat_vec, learning_windows=learning_window, dl_mimo=dl_mimo)
+env = cellularEnv(ser_cat = ser_cat_vec, learning_windows = learning_window, dl_mimo = dl_mimo)
 action_space = action_space(10, 3) * band_per
 num_actions = len(action_space)
-print(num_actions)
+# print(num_actions)
 
 model = WGAN_GP_Agent(static_policy=False, num_input=3, num_actions=num_actions)
 # model.load_w()
@@ -526,7 +608,7 @@ actions = []
 SE = []
 QoE = []
 
-for frame in range(1, total_timesteps + 1):
+for frame in tqdm(range(1, total_timesteps + 1)):
     # env.render()
     # epsilon = exploration.value(t)
     epsilon = epsilon_by_frame(frame)
