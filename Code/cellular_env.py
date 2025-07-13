@@ -1,12 +1,13 @@
 '''
+0. 本論文的時間定義：
+        frame = learning window = 1s = 2000 subframe (每一個 frame 做一次上層 by GAN-DDQN)
+        time_subframe = 0.5ms (每一個 time_subframe 做一次下層 by RR) (我自己把 time_subframe 叫 timeslot)
 1. For downlink simulations in one-single base station environment.
 2. This simulation is based on 4G LTE & 3GPP TS 36.814 Standard.
 3. unit in this environment: 
     tx, rx power : dBW
     gain, loss   : dB (dB : relative unit, 10 x log_10 (A / B))
     in SNR       : W (dBW must turn into W ---> value_in_W = 10** (value_in_dBW / 10))
-4. Model updates every 60000 (Learning windows) iterations (timeslots). Every timeslots generate an experience
-    
 '''
 
 import numpy as np
@@ -45,7 +46,7 @@ class cellularEnv(object):
         # 由上可以合理推出本模擬使用的頻段是 [2GHz - 5MHz, 2GHz + 5MHz]
 
         # LTE 的一個 subframe = 1ms，一個 slot = 0.5ms。(1 subframe = 2 slots)
-        # 這邊是指一個 timeslot = 0.5ms，只是他名字用錯
+        # 這邊是指一個 timeslot = 0.5ms，只是他這邊命名沒在管 LTE
         # unit : s
         time_subframe = 0.5 * 10 ** (-3), # by LTE, 0.5 ms
 
@@ -63,8 +64,9 @@ class cellularEnv(object):
         # rx = receive
         rx_gain = 20,  # dB
 
-        # RL 的學習視窗，即學習一次會經過幾個 time_subframes (以 time_subframes 為單位)
+        # RL 的學習視窗，可以想成是一個 episode。在這個 episode 中會更新模型數次
         # 可以得出一次訓練會要 60000 * 0.5ms = 30s
+        # 在論文實驗設定中將 learning windows 設為 2000，由此，每 2000 * 0.5ms = 1s 會更新一次
         learning_windows = 60000,
     ):
 
@@ -96,7 +98,7 @@ class cellularEnv(object):
         self.UE_latency = np.zeros([Queue_max, UE_max_no])
         # 存所有 UE 下一個封包可以產生的時間，當值為 0 的時候才可以產生新的封包
         self.UE_readtime = np.zeros(UE_max_no)
-        # 存每個 UE 在當前 timeslot 分到多少頻寬
+        # 存每個 UE 在當前 timeslot 分到多少頻寬 (units : RB)
         self.UE_band = np.zeros(UE_max_no)
         # 隨機生成所有 UE 的位置
         # [-self.BS_radius, self.BS_radius] 中均勻隨機產生出一個 shape 為 [self.UE_max_no, 2] 的二維陣列
@@ -110,11 +112,12 @@ class cellularEnv(object):
         self.path_loss = 145.4 + 37.5 * np.log10(dis).reshape(-1, 1)
 
         # RL 學習視窗，以 s 為單位，這邊可以推得就是 60000 * 0.0005 = 30s。代表一每 30s 更新一次參數
+        # 論文實驗環境中是設為 2000，代表每 2000 * 0.5ms = 1s 會更新一次參數
         self.learning_windows = round(learning_windows * self.time_subframe, 4)
 
         self.ser_cat = ser_cat
         if len(self.ser_cat) > 1:
-            self.band_ser_cat = np.zeros(len(ser_cat))  # 創建存各種網路切片每個 timeslot 分到的頻寬資源的 np.ndarray
+            self.band_ser_cat = np.zeros(len(ser_cat))  # 創建存各種網路切片每個 learning window 分到的頻寬資源的 np.ndarray
             if len(ser_prob) == len(self.ser_cat):  # 這邊就是把 [6 : 6 : 1] 正規化成機率
                 self.ser_prob = ser_prob / np.sum(ser_prob)  # normalization
             else:
@@ -220,13 +223,13 @@ class cellularEnv(object):
                 else:  # 非第一個 timeslot
                     self.band_ser_cat[i] += np.sum(self.UE_band[self.UE_cat == self.ser_cat[i]])
                     if (self.sys_clock * 10000) % (self.learning_windows * 10000) == 0:  # 本 Learning Window 最後一個 timeslot
-                        lw = (self.learning_windows * 10000) / (self.time_subframe * 10000)  # lw = 60000 (Learning Window 有幾個 timeslot)
-                        self.band_ser_cat[i] = self.band_ser_cat[i] / lw  # 算出每個網路切片平均一個 timeslot 分到的頻寬資源量。
+                        lw = (self.learning_windows * 10000) / (self.time_subframe * 10000)  # (Learning Window 有幾個 timeslot)
+                        self.band_ser_cat[i] = self.band_ser_cat[i] / lw  # 算出每個網路切片平均一個 learning window 分到的頻寬資源量。
 
     #=======================================================================================================================================#
     # 根據 Shannon 計算每個 UE 能達到的資料傳輸速率
     # 透過算出的資料傳輸速率進行封包傳輸，並算出當前 timeslot 的 reward
-    # 當前 timeslot 結束之後清空所有的 buffer，代表傳不完的封包會被丟棄
+    # 結算當前 timeslot 結束後的 buffer 情況，傳完的封包會將其對應的 latency 刪除，還沒傳完的會續留
     def provisioning(self):
         UE_index = np.where(self.UE_band != 0)  # 找出有被分配到頻寬的 UE
         self.channel_model()  # 算出所有 UE 的通道狀況 (考慮大尺度衰弱後的通道，unit = dB) -> chan_loss (shape : (UE_max_no, 1))

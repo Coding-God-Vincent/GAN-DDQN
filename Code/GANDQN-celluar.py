@@ -1,7 +1,14 @@
 '''
+* 本論文的時間定義：
+    frame = learning window = 1s = 2000 subframe (每一個 frame 做一次上層 by GAN-DDQN)
+    time_subframe = 0.5ms (每一個 time_subframe 做一次下層 by RR)
+
 * 這邊的對模型輸入輸出的註解都是以 batch 的角度在寫，但其實這種 batch 的操作模型會自動做，所以可以看到在程式的寫法中都沒有考慮 batch，只考慮單一狀態的輸入。
 
+* 每 1s 會做一次上層的分配 (SDN Controller 分給 NS)，每 0.5ns 會做一次下層分配 (NS 分給 UE)。
 
+* 論文的系統時間的 Granularity = 0.5ms (timeslot)，一個 Learning window = 2000 個 timslot，即 2000 * 0.5ms = 1s。
+  一個 learning window 會做一次上層分配，2000 次下層分配。每個 learning window 會更新一次參數。
 '''
 
 import torch, time, os, pickle, glob, math, json
@@ -16,7 +23,6 @@ from tqdm.auto import tqdm
 # simulation environment
 from cellular_env import cellularEnv
 
-import matplotlib
 import matplotlib.pyplot as plt
 
 import torch.nn as nn
@@ -161,8 +167,8 @@ class WGAN_GP_Agent(object):
         self.target_net_update_freq = 10  # target_G 參數逼近 G (instead of sync.) every 10 steps
         self.experience_replay_size = 2000
         self.batch_size = 32
-        self.update_freq = 200  # update WGAN_GP every 200 steps (updates 60000/200 = 300 in 1 learning window)
-        # 而每次 update() 都會更新 62 次 (D 更新 62 * n_critic，G 更新 62 * n_gen(1) 次)
+        self.update_freq = 200  # update WGAN_GP every 200 learning windows
+        # 一次 update 會更新 len(memroy) / 32 輪。每輪更新 n_critic 次 D，n_gen 次 G
         self.learn_start = 0  # 從第幾步開始允許模型開始更新參數
         self.tau = 0.1  # default is 0.005 (不是 G 使用的 tau，是 Target_G 逼近 G 時使用的)
         self.static_policy = False  # True -> evaluation，False -> train
@@ -231,6 +237,7 @@ class WGAN_GP_Agent(object):
     # push experience into replay buffer
     def append_to_replay(self, s, a, r, s_):
         self.memory.push((s, a, r, s_))
+        
 
     # 存模型的參數
     def save_w(self):
@@ -274,7 +281,7 @@ class WGAN_GP_Agent(object):
         plt.plot(self.train_hist['G_loss'], 'r')  # r -> red
         plt.plot(self.train_hist['D_loss'], 'b')
         plt.legend(['G_loss', 'D_loss'])  # 加上圖例 (對應到線的顏色)
-        plt.pause(0.001)  # 讓 figure 短暫暫停 0.001s，讓圖表即時更新和顯示
+        # plt.pause(0.001)  # 讓 figure 短暫暫停 0.001s，讓圖表即時更新和顯示
 
     # 從 replay buffer 中取出 minibatch 的資料並依照其性質分成數個 batch 的 tensor
     def prep_minibatch(self, prev_t, t):
@@ -346,7 +353,7 @@ class WGAN_GP_Agent(object):
             param_group['lr'] = lr
 
     # 更新 G、D 參數
-    # frame : 當前 timeslot
+    # frame : 當前是第幾個 Learning windows
     def update(self, frame = 0):
         
         # 若現在是測試階段就不做 update
@@ -366,6 +373,7 @@ class WGAN_GP_Agent(object):
             return None
         
         # 開始 update ============================================
+        print("\nTraining...\n")
         
         # 決定 G & D 的 lr
         self.adjust_G_lr(frame)
@@ -483,7 +491,7 @@ def action_space(total, num):  # total = 10 (total_band = 10MHz)，num = 3 (3 ty
 
 #=============================================================================================================================================#
 # 進入神經網路前的狀態前處理，將 state 中的值做正規化，使整個 state 各元素的均值為 0、標準差為 1
-def state_update(state, ser_cat):  # state : 當前 timeslot 各網路切片要傳送的封包個數 [d0, d1, d2]
+def state_update(state, ser_cat):  # state : 當前 Learning window 各網路切片要傳送的封包個數 [d0, d1, d2]
     discrete_state = np.zeros(state.shape)
 
     # 若 state 內皆為 0，則不用進行前處理，輸入的狀態為一個零矩陣
@@ -511,7 +519,7 @@ def state_update(state, ser_cat):  # state : 當前 timeslot 各網路切片要�
 
 # qoe -> 三種網路切片在整個 learning window 的 SSR
 # se  -> 整個 learning window 中的平均每個 timeslot 的 SE
-# threshold -> 當前 timeslot 對模型的利用率要求，會隨時間單調上升
+# threshold -> 當前 Learning window 對模型的利用率要求，會隨時間單調上升
 def calc_reward(qoe, se, threshold):
     # 依照權重算出 utility
     utility = np.matmul(qoe_weight, qoe.reshape((3, 1))) + se_weight * se 
@@ -555,116 +563,160 @@ def plot_rewards(rewards):
 #=============================================================================================================================================#
 # 訓練過程
 
+# 設定 GPU
 # torch.cuda.manual_seed(100)
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device('cuda')
+
+# 設定 epsilon
+# Create the schedule for exploration starting from 1.
+# exploration_final_eps = 0.02
 # exploration_fraction = 0.3
 # exploration_start = 0.
-total_timesteps = 10000
-# exploration_final_eps = 0.02
-
+# exploration = LinearSchedule(schedule_timesteps=int(exploration_fraction * total_timesteps),
+#                                 start_timesteps = int(total_timesteps * exploration_start),
+#                                 initial_p=1.0,
+#                                 final_p=exploration_final_eps)
 #epsilon variables
 epsilon_start    = 1.0
 epsilon_final    = 0.01
 epsilon_decay    = 3000
 epsilon_by_frame = lambda frame_idx: epsilon_final + (epsilon_start - epsilon_final) * math.exp(-1. * frame_idx / epsilon_decay)
 
+# plt.ion()  # 開啟圖片互動模式，可以在訓練時即時更新圖片
+
+# 總共會有 10000 個 learning windows
+# 一個 learning windows = 2000 timeslot (0.5ms) = 1s
+total_timesteps = 10000
 # parameters of celluar environment
 ser_cat_vec = ['volte', 'embb_general', 'urllc']
-band_whole_no = 10 * 10**6
-band_per = 1 * 10**6
+band_whole_no = 10 * 10**6  # 10MHz
+band_per = 1 * 10**6  # bandwidth allocation resolution : 1MHz
 qoe_weight = [1, 1, 1]
 se_weight = 0.01
-dl_mimo = 64
-learning_window = 2000
-
-# Create the schedule for exploration starting from 1.
-# exploration = LinearSchedule(schedule_timesteps=int(exploration_fraction * total_timesteps),
-#                                 start_timesteps = int(total_timesteps * exploration_start),
-#                                 initial_p=1.0,
-#                                 final_p=exploration_final_eps)
-
-plt.ion()  # 開啟圖片互動模式，可以在訓練時即時更新圖片
-
+dl_mimo = 64  # MIMO 天線數
+learning_window = 2000  # 一個 episode
 env = cellularEnv(ser_cat = ser_cat_vec, learning_windows = learning_window, dl_mimo = dl_mimo)
+env.countReset()  # 初始化各計數器 (每個 learning window 都會重置一次)
+env.activity()  # 開始第一個 timeslot，指派各 UE readtime，並依照 readtime 決定是否要新增封包
+
+# 設定 action_space
 action_space = action_space(10, 3) * band_per
 num_actions = len(action_space)
-# print(num_actions)
+# print(num_actions)  # 36
 
-model = WGAN_GP_Agent(static_policy=False, num_input=3, num_actions=num_actions)
-# model.load_w()
+# 設定 model
+# static_policy = False -> 代表現在是 train。
+# num_input = state_size = 3。一個 state 是由三個數字組成 (三種網路切片每秒要傳送的封包個數)，num_actions = 36
+model = WGAN_GP_Agent(static_policy = False, num_input = 3, num_actions = num_actions)
 G_noise = (torch.rand(1, model.num_samples)).to(device)
-env.countReset()
-env.activity()
-observation = state_update(env.tx_pkt_no, env.ser_cat)
-print(observation)
-# observation = torch.from_numpy(observation).unsqueeze(0).to(torch.float)
+observation = state_update(env.tx_pkt_no, env.ser_cat)  # 進行狀態前處理
+# print(f"obeservation shape : {observation.shape}")
 
 log = {}
-rewards = []
-uyilitys = [0.]
 observations = []
-actions = []
-SE = []
-QoE = []
+actions = []  # 紀錄每個 learning window 的 action
+rewards = []  # 紀錄每個 learning window 的 reward
+utilities = [0.]  # 紀錄每個 learning window 的 utility
+SE = []  # 紀錄每個 learning window 的 SE (一個 Learning window 平均一個 timeslot 的 SE)
+QoE = []  # 紀錄每個 learning window 的 QoE (SSR) (一個 Learning window 中滿足要求傳送的封包數 / 一個 learning window 要傳送的封包數)
 
+# 跑 10000 個 learning windows
 for frame in tqdm(range(1, total_timesteps + 1)):
-    # env.render()
-    # epsilon = exploration.value(t)
+    
+    # 產生該 learning windows 要用的 epsilon
     epsilon = epsilon_by_frame(frame)
+    
+    # 分上層 (每 1s 做一次)，做 1 次
     # Select and perform an action
-    observations.append(observation.tolist())
-    action = get_action(model, observation, G_noise, epsilon, device)
+    observations.append(observation.tolist())  # 整個資料結構都變成 list
+    action = get_action(model, observation, G_noise, epsilon, device)  # 根據 ε-greedy 選出 action
     actions.append(action)
-    env.band_ser_cat = action_space[action]
+    env.band_ser_cat = action_space[action]  # 將各網路接片的資源分配結果存入 env
     prev_observation = observation
 
-    for i in itertools.count():
-        env.scheduling()
-        env.provisioning()
-        if i == (learning_window - 1):
+    # 上層分完，分下層 (每 0.5ms 做一次)，做 200 次
+    # i 就是一個 timeslots (0.5ms)
+    for i in itertools.count():  # itertools.count() : 從 0 開始到無限
+        env.scheduling()  # 每一個 timeslots 做一次下層分配
+        env.provisioning()  # 根據 UE 分到的 RB 個數算出當前 timeslot 的 SE、SSR
+        if i == (learning_window - 1):  # 分 1999 次 (下 1s 開始前的一個 timeslot)
             break
         else:
-            env.bufferClear()
-            env.activity()
+            env.bufferClear()  # 維護使用者對應的 Queue (還沒分配出去的封包繼續留在 buffer 中)
+            env.activity()  # 指派 UE readtime，並依照 readtime 決定是否產生封包
     
-    qoe, se = env.get_reward()
+    # 做完一整個 learning window，算這個 learning window 的 reward
+    qoe, se = env.get_reward()  # 該 Learning window 中滿足要求傳送出去的封包 / 總封包數, 該 learning window 中平均一個 timeslot 的 SE
     # utility, reward = calc_reward(qoe, se, 3, 5.7)
-    threshold = 3.5 + 1.5 * frame / (total_timesteps/1.5)
-    print(threshold)
-    utility, reward = calc_reward(qoe, se, threshold)
+    threshold = 3.5 + 1.5 * frame / (total_timesteps / 1.5)  # threshold -> 當前 learning window 模型預計要達到的標準 (隨時間單調上升)，達到才有 reward = 1
+    utility, reward = calc_reward(qoe, se, threshold)  # 根據 threshold 算出當前 learning window 得到的 reward
+    
+    # 紀錄相關結果
     QoE.append(qoe.tolist())
     SE.append(se[0])
     rewards.append(reward)
-    uyilitys.append(utility)
+    utilities.append(utility)
 
+    # 準備做下一次的上層，取出 state
     observation = state_update(env.tx_pkt_no, env.ser_cat)
-    print(observation)
-    # observation = torch.from_numpy(observation).unsqueeze(0).to(torch.float)
-
+    
+    # 將 experience 存入 replay buffer
     model.append_to_replay(prev_observation, action, reward, observation)
+
+    # 更新模型
     model.update(frame)
+    
+    # 結束一個 learning window，重設相關計數器
     env.countReset()
+    # 設定各 UE readtime，並根據該 readtime 決定是否新增封包
     env.activity()
+    
+    
     print('GANDDQN=====episode: %d, epsilon: %.3f, utility: %.5f, reward: %.5f' % (frame, epsilon, utility, reward))
     print('qoe', qoe)
     print('bandwidth-allocation solution', action_space[action])
 
+    # 每個 learning window 結束後都更新一次 reward 圖
     # plot_rewards(rewards)
+    
+    # 每 200 個 learning window 紀錄一次
+    # if frame % 200 == 0:
+        # print('frame index [%d], epsilon [%.4f]' % (frame, epsilon))
+        # model.save_w()
+        # log['state'] = observations
+        # log['action'] = actions
+        # log['SE'] = SE
+        # log['QoE'] = QoE
+        # log['reward'] = rewards
 
-    if frame % 200 == 0:
-        print('frame index [%d], epsilon [%.4f]' % (frame, epsilon))
-        model.save_w()
-        log['state'] = observations
-        log['action'] = actions
-        log['SE'] = SE
-        log['QoE'] = QoE
-        log['reward'] = rewards
-
-        f = open('./log/GANDDQN/log_10M_1M_LURLLC.txt', 'w')
-        f.write(json.dumps(log))
-        f.close()
+        # f = open('./log/GANDDQN/log_10M_1M_LURLLC.txt', 'w')
+        # f.write(json.dumps(log))
+        # f.close()
     
 print('Complete')
-plt.ioff()
-plt.show()
+
+# show figures of each metrics
+# loss figure (figure(2))
+model.plot_loss()
+plt.savefig("loss.png")
+
+# qoe figure (figure(3))
+plt.figure(3)
+plt.clf()
+QoE = np.array(QoE)
+plt.title('Training...')
+plt.xlabel('Episode')
+plt.ylabel('QoE')
+plt.plot(QoE)
+plt.savefig("QoE.png")
+
+# se figure (figure(4))
+plt.figure(4)
+plt.clf()
+SE = np.array(SE)
+plt.title('Training...')
+plt.xlabel('Episode')
+plt.ylabel('SE')
+plt.plot(SE)
+plt.savefig("SE.png")
