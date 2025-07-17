@@ -1,0 +1,3 @@
+# 忽略 pyc 檔與 __pycache__ 資料夾
+*.pyc
+__pycache__/
