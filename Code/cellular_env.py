@@ -138,8 +138,9 @@ class cellularEnv(object):
         if self.chan_mod == '36814':
             shadowing_var = 8  # rayleigh fading shadowing variance 8dB。代表會有正負 8dB 的功率波動。
             # path_loss.shape = (UE_max_no, 1)，為每一個 UE 會有的 path_loss
-            # 後面的 random.normal(...) 會產生出一個 (UE_max_no, 1) 的 np.ndarray，內容為各 UE 的 shadow fading 值
-            self.chan_loss = self.path_loss + np.random.normal(0,shadowing_var, self.UE_max_no).reshape(-1,1)  
+            # 後面的 random.normal(...) 會產生出一個 (UE_max_no) 的 np.ndarray，內容為各 UE 的 shadow fading 值
+            # 最後 reshape() 會將 shape 從 (UE_max_no) 轉成 (UE_max_no, 1)
+            self.chan_loss = self.path_loss + np.random.normal(0, shadowing_var, self.UE_max_no).reshape(-1,1)  
 
     #=======================================================================================================================================#
     # 排程模型 : 網路切片分 RB 給其 UE，下面所說的兩種分法是分配在均分給 Active Users 後剩餘的 RB
@@ -234,7 +235,7 @@ class cellularEnv(object):
         UE_index = np.where(self.UE_band != 0)  # 找出有被分配到頻寬的 UE
         self.channel_model()  # 算出所有 UE 的通道狀況 (考慮大尺度衰弱後的通道，unit = dB) -> chan_loss (shape : (UE_max_no, 1))
         rx_power = 10 ** ((self.BS_tx_power - self.chan_loss + self.UE_rx_gain) / 10)  # 接收端收到的訊號的功率強度 (unit : W)，shape : (UE_max_no, 1)
-        rx_power = rx_power.reshape(1, -1)[0]  # 應刪除 [0]，這樣會剩下一個元素**********
+        rx_power = rx_power.reshape(1, -1)[0]  # 把 shape 從 (UE_max_no, 1) 轉為 (1, UE_max_no) 再由 [0] 取出
 
         # 算出各 UE 的資料傳輸速率 (unit : bits/s) by Shannon，shape : (UE_max_no, 1)
         rate = np.zeros(self.UE_max_no)
@@ -314,7 +315,7 @@ class cellularEnv(object):
                     
                     # 依照 UE 隸屬的網路切片規則來產生封包
                     if self.UE_cat[ue_id] == 'volte':
-                        self.UE_buffer[buf_ind, ue_id] = 40 * 8  # 產生一個大小為 320bits 的封包放到剛剛的找到的空位
+                        self.UE_buffer[buf_ind, ue_id] = 40 * 8  # 產生一個大小為 40Byte 的封包放到剛剛的找到的空位
                         self.UE_readtime[ue_id] = np.random.uniform(0,160 * 10 ** (-3), 1)  # 每次產生完封包之後都會再隨機產生 readtime
 
                     elif self.UE_cat[ue_id] == 'embb_general':
@@ -332,8 +333,10 @@ class cellularEnv(object):
                         #tmp_buffer_size = np.random.lognormal(14.45,0.35,[1,1])
                         # if tmp_buffer_size > 5 * 10 **6:
                         #      tmp_buffer_size > 5 * 10 **6
-                        # tmp_buffer_size = np.random.choice([6.4*8*10**3, 12.8*8*10**3, 19.2*8*10**3, 25.6*8*10**3, 32*8*10**3])
-                        tmp_buffer_size = np.random.choice([0.3*8*10**6, 0.4*8*10**6, 0.5*8*10**6, 0.6*8*10**6, 0.7*8*10**6])  # buffer_size 介於 0.3 ~ 0.7M bits
+                        # 小封包
+                        tmp_buffer_size = np.random.choice([6.4*8*10**3, 12.8*8*10**3, 19.2*8*10**3, 25.6*8*10**3, 32*8*10**3])  # {6.4, 12.8, 19.2, 25.6, 32} KB 
+                        # 大封包
+                        # tmp_buffer_size = np.random.choice([0.3*8*10**6, 0.4*8*10**6, 0.5*8*10**6, 0.6*8*10**6, 0.7*8*10**6])  # buffer_size 介於 0.3 ~ 0.7M bits
                         self.UE_buffer[buf_ind,ue_id] = tmp_buffer_size
                         # 再產生一個 readtime
                         self.UE_readtime[ue_id]  = np.random.exponential(180* 10 ** -3, [1, 1])
@@ -414,14 +417,14 @@ class cellularEnv(object):
                             if (self.UE_buffer_backup[i, ue_id] / self.UE_latency[i, ue_id] >= 100 * 10 ** 6) & (self.UE_latency[i, ue_id] < 10 * 10 **(-3) - handling_latency):
                                 self.succ_tx_pkt_no[cat_index] += 1
                     
-                    # 屬於 uRLLC 網路切片，SLA : rate >= 10Mbps、latency < 3ms
+                    # 屬於 uRLLC 網路切片，SLA : rate >= 10Mbps、latency < 1ms
                     elif self.UE_cat[ue_id] == 'urllc': 
                         cat_index = self.ser_cat.index('urllc')   
                         if (self.UE_latency[i, ue_id] == self.time_subframe):  # 封包只用一個 timeslot 就傳完
-                            if (rate[ue_id] >= 10 * 10 ** 6) & (self.UE_latency[i, ue_id] < 3 * 10 **(-3) - handling_latency):
+                            if (rate[ue_id] >= 10 * 10 ** 6) & (self.UE_latency[i, ue_id] < 1 * 10 **(-3) - handling_latency):
                                 self.succ_tx_pkt_no[cat_index] += 1
                         else:  # 封包用不只一個 timeslot 才傳完
-                            if (self.UE_buffer_backup[i, ue_id] / self.UE_latency[i, ue_id] >= 10 * 10 ** 6) & (self.UE_latency[i, ue_id] < 3 * 10 **(-3) - handling_latency):
+                            if (self.UE_buffer_backup[i, ue_id] / self.UE_latency[i, ue_id] >= 10 * 10 ** 6) & (self.UE_latency[i, ue_id] < 1 * 10 **(-3) - handling_latency):
                                 self.succ_tx_pkt_no[cat_index] += 1
 
     #=======================================================================================================================================#
@@ -494,31 +497,32 @@ class cellularEnv(object):
 # 模擬封包傳輸給 ue_id 的 UE 的過程 : 所有封包共用 rate，從 index0 的開始傳
 # buffer -> UE_buffer[:, ue_id] : ue_id 的 UE 對應的 Queue 的那五格中的封包大小
 # rate -> ue_id 的 UE 的資料傳輸速率
-def bufferUpdate(buffer, rate, time_subframe):  
-    bSize = buffer.size  # Queue 中的封包個數
-    for i in range(bSize):
-        if buffer[i] >= rate * time_subframe:
-            buffer[i] -= rate * time_subframe  # 剩餘 bits
-            rate = 0
-            break
-        else:  # ??
-            rate_ = buffer[i]
-            buffer[i] = 0
-            rate -= rate_
-    return buffer
+# def bufferUpdate(buffer, rate, time_subframe):  
+#     bSize = buffer.size  # Queue 中的封包個數
+#     for i in range(bSize):
+#         if buffer[i] >= rate * time_subframe:
+#             buffer[i] -= rate * time_subframe  # 剩餘 bits
+#             rate = 0
+#             break
+#         else:  # ??
+#             rate_ = buffer[i]
+#             buffer[i] = 0
+#             rate -= rate_
+#     return buffer
 
 # 我認為正確的版本
-# def bufferUpdate_v2(buffer, rate, time_subframe):
-#     bSize = buffer.size
-#     remaining_transmit_bits = rate * time_subframe  # unit : bits
-#     for i in range(bSize):
-#         if buffer[i] >= remaining_transmit_bits:
-#             buffer[i] -= remaining_transmit_bits
-#             remaining_transmit_bits = 0
-#             break
-#         else:
-#             remaining_transmit_bits -= buffer[i]
-#     return buffer
+def bufferUpdate(buffer, rate, time_subframe):
+    bSize = buffer.size
+    remaining_transmit_bits = rate * time_subframe  # unit : bits
+    for i in range(bSize):
+        if buffer[i] >= remaining_transmit_bits:
+            buffer[i] -= remaining_transmit_bits
+            remaining_transmit_bits = 0
+            break
+        else:
+            remaining_transmit_bits -= buffer[i]
+            buffer[i] = 0
+    return buffer
             
 #=======================================================================================================================================#
 # 更新對應於 ue_id 的 UE 的 Queue 中的五格封包的 Latency，即各封包的 latency 加上一個 timeslot (0.5ms)
