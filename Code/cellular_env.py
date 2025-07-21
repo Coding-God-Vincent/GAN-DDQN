@@ -192,7 +192,7 @@ class cellularEnv(object):
             if self.sys_clock == self.time_subframe:  # 整個模擬剛開始，初始化 ser_schedu_ind[0], [1], [2] = 0
                 self.ser_schedu_ind =  0
                 
-            UE_index = np.where((self.UE_buffer[0, :] != 0))[0]  # UE_index : Active Users' indices
+            UE_index = np.where((self.UE_buffer[0, :] != 0))[0]  # UE_index : Active Users' index
             UE_Active_No = len(UE_index)  # UE_Active_No : No. of Active Users
             if UE_Active_No != 0:
                 RB_No = band_whole // (180 * 10**3)  # Divide Bandwidth into RBs
@@ -217,7 +217,7 @@ class cellularEnv(object):
             # 每個 Learning Window 都重置一次各網路切片所分到的頻寬資源
             if (self.sys_clock * 10000) % (self.learning_windows * 10000) == (self.time_subframe * 10000):
                 self.band_ser_cat = np.zeros(len(self.ser_cat))
-            # 計算這整個 Learning Window，各網路切片總共各分到多少的頻寬資源
+            # 計算這整個 Learning Window，各網路切片平均一個 timeslot 分到多少的頻寬資源
             for i in range(len(self.ser_cat)):
                 if (self.sys_clock * 10000) % (self.learning_windows * 10000) == (self.time_subframe * 10000):  # 本 Learning Window 第一個 timeslot
                     self.band_ser_cat[i] = np.sum(self.UE_band[self.UE_cat == self.ser_cat[i]])
@@ -225,7 +225,7 @@ class cellularEnv(object):
                     self.band_ser_cat[i] += np.sum(self.UE_band[self.UE_cat == self.ser_cat[i]])
                     if (self.sys_clock * 10000) % (self.learning_windows * 10000) == 0:  # 本 Learning Window 最後一個 timeslot
                         lw = (self.learning_windows * 10000) / (self.time_subframe * 10000)  # (Learning Window 有幾個 timeslot)
-                        self.band_ser_cat[i] = self.band_ser_cat[i] / lw  # 算出每個網路切片平均一個 learning window 分到的頻寬資源量。
+                        self.band_ser_cat[i] = self.band_ser_cat[i] / lw  # 算出每個網路切片平均一個 timeslot 分到的頻寬資源量。
 
     #=======================================================================================================================================#
     # 根據 Shannon 計算每個 UE 能達到的資料傳輸速率
