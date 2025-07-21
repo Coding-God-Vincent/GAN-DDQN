@@ -1,3 +1,16 @@
+'''
+* 與 GAN-DDQN 不同 :
+    * 細節 : 
+        * particles 數量 != noise vector 大小
+        * common layer 只有一層
+        * noise 進入 Generator 後並沒有做 cosine basis encoding
+    * 大架構 : 
+        * GAN-DDQN 輸出所有行動的 Q 值機率分布。Output_shape = (batch_size, num_actions, num_samples)
+        * Dueling GAN-DDQN 輸出兩個 : 
+            1. 當前 State 得機率分布。Output_shape = (batch_size, num_particles)
+            2. 所有 Action 的 Advantage 值。Output_shape = (batch_size, num_actions)
+'''
+
 import torch, time, os, pickle, glob, math, json
 import numpy as np
 import csv
@@ -20,8 +33,10 @@ from utils.ReplayMemory import ExperienceReplayMemory, PrioritizedReplayMemory
 # from utils.wrappers import *
 from utils.utils import initialize_weights
 
-
+#=============================================================================================================================================#
 #%%
+# Input_shape : State (batch_size, state_size) & Noise (noise_size)
+# Output: State_value -> Probability Distribution & Advantage_value -> single value
 class Generator(nn.Module):
     def __init__(self, device, num_actions, num_particles, state_size=3, noise_size=10):
         # device: 'cpu' or 'gpu';
@@ -35,49 +50,59 @@ class Generator(nn.Module):
         self.num_actions = num_actions
         self.num_particles = num_particles
         self.device = device
+        
+        # 1. Embedded layer
+        self.embed_layer_state = nn.Linear(self.state_size, 256)  # output_shape (batch_size, 256)
+        self.embed_layer_noise = nn.Linear(self.noise_size, 256)  # output_shape (batch_size, 256)
 
-        self.embed_layer_state = nn.Linear(self.state_size, 256)
-        self.embed_layer_noise = nn.Linear(self.noise_size, 256)
-
+        # 2. Common Layer
         # self.common_layer1 = nn.Linear(256, 256)
         # self.common_layer2 = nn.Linear(256, 256)
-        self.common_layer = nn.Linear(256, 256)
+        self.common_layer = nn.Linear(256, 256)  # output_shape (batch_size, 256)
 
+        # 3.1 State Value Layer (輸出為一個機率分布，一個動作有 num_particles 個值)
         self.value_layer1 = nn.Linear(256, 128)
         self.value_layer2 = nn.Linear(128, num_particles)
         # self.value_layer = nn.Linear(256, num_particles)
 
+        # 3.2 Advantage Value Layer (輸出並非機率分布，一個動作對應一個值)
         self.advantage_layer1 = nn.Linear(256, 128)
         self.advantage_layer2 = nn.Linear(128, num_actions)
         # self.advantage_layer = nn.Linear(256, num_actions)
+
         initialize_weights(self)
 
     def forward(self, state, noise):   
-        # state: environment state, a 3-dimention vector 
-        # noise: sampled noise, a noise_size-dimention vector
-        state_embedding = F.relu(self.embed_layer_state(state))     # batch_size x 256
-        noise_embedding = F.relu(self.embed_layer_noise(noise))     # batch_size x 256
+        # state: environment state, a 3-dimension vector 
+        # noise: sampled noise, a noise_size-dimension vector (default noise_size = 10 != num_particles)
+        state_embedding = F.relu(self.embed_layer_state(state))  # output_shape (batch_size, 256)
+        noise_embedding = F.relu(self.embed_layer_noise(noise))  # output_shape (batch_size, 256)
 
-        # element-wise product of embedded state and noise
+        # Hadamard Product : element-wise product of embedded state and noise
+        # ex:
+        # a = torch.tensor([1, 2, 3]), b = torch.tensor([4, 5, 6])
+        # torch.mul(a, b) = [4, 10, 18]
         x = torch.mul(state_embedding, noise_embedding)
+
         # through common layers
         # x = F.relu(self.common_layer1(x))
         # x = F.relu(self.common_layer2(x))
-        x = F.relu(self.common_layer(x))
+        x = F.relu(self.common_layer(x))  # output_shape (batch_size, 256)
 
         # output value vector, which is a set of particles coming from value distribution
-        value = F.relu(self.value_layer1(x))  
-        value = F.relu(self.value_layer2(value))    # batch_size x num_particles
+        value = F.relu(self.value_layer1(x))  # output_shape(batch_size, 128)
+        value = F.relu(self.value_layer2(value))  # output_shape(batch_size, num_particles)
         # value = F.relu(self.value_layer(x))
 
         # output advantage, which is a scale number for each action
-        advantage = F.relu(self.advantage_layer1(x))  
-        advantage = self.advantage_layer2(advantage)    #batch_size x num_actions
+        advantage = F.relu(self.advantage_layer1(x))  # output_shape (batch_size, 128)
+        advantage = self.advantage_layer2(advantage)  # output_shape (batch_size, num_actions)
         # advantage = torch.tanh(self.advantage_layer(x))
 
-        return value, advantage
+        return value, advantage  # output_shape (batch_size, num_particles), (batch_size, num_actions)
     
-#%%
+#=============================================================================================================================================#
+# Input_shape : state_value_particles (batch_size, num_particles)
 class Discriminator(nn.Module):
     def __init__(self, num_particles):
         super(Discriminator, self).__init__()
@@ -89,11 +114,13 @@ class Discriminator(nn.Module):
         initialize_weights(self)
 
     def forward(self, value_particles):
-        x = F.relu(self.fc1(value_particles))
-        x = F.relu(self.fc2(x))
-        out = self.fc3(x)
+        x = F.relu(self.fc1(value_particles))  # output_shape (batch_size, 256)
+        x = F.relu(self.fc2(x))  # output_shape (batch_size, 256)
+        out = self.fc3(x)  # output_shape (batch_size, 1)
         return out
 
+#=============================================================================================================================================#
+# 調整 ɛ-greedy 的 ɛ (這邊沒用到)
 class LinearSchedule(object):
     def __init__(self, schedule_timesteps, start_timesteps, final_p, initial_p=1.0):
         """Linear interpolation between initial_p and final_p over
@@ -123,6 +150,7 @@ class LinearSchedule(object):
             fraction = min(float(t) / (self.schedule_timesteps + self.start_timesteps), 1.0)
             return self.initial_p + fraction * (self.final_p - self.initial_p)
 
+#=============================================================================================================================================#
 class WGAN_GP_Agent(object):
     def __init__(self, device, state_size, noise_size, num_actions, num_particles):
         super(WGAN_GP_Agent, self).__init__()

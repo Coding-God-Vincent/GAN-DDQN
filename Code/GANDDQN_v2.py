@@ -12,7 +12,9 @@
 '''
 
 '''跟 GANDDQN_v1 的差別
-* GANDDQN_v1 沒有用 Target Network ()
+* 加上 moving_average()，讓結果輸出更好看。
+
+* 把 WGAN-GP 改為 WGAN-LP (Lipschitz Penalty)。
 '''
 
 #%%
@@ -111,8 +113,8 @@ class Generator(nn.Module):
 
 #=============================================================================================================================================# 
 # 建立 Disciminator 網路  
-# input_shape : [self.batch_size, self.num_actions, self.num_samples]
-# output_shape : [self.batch_size, self.num_actions, self.num_outputs]
+# input_shape : [self.batch_size, self.num_samples]
+# output_shape : [self.batch_size, self.num_outputs]
 class Discriminator(nn.Module):
     def __init__(self, num_samples, num_outputs):  # num_output = 1
         super(Discriminator, self).__init__()
@@ -127,13 +129,14 @@ class Discriminator(nn.Module):
         # add little noise
         # z = 0. * torch.randn(self.batch_size, self.num_samples).to(self.device) = 0
         # 所以其實沒有加上 noise
-        x = x + z
+        # x = x + z
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         out = self.fc3(x)
         return out
 
 #=============================================================================================================================================#
+# 沒用到
 # 到 start_timestep 之後開始做線性衰弱 (Linear Schedule)，用於控制 ɛ-greedy
 # schedule_timesteps : 從 init_p 到 final_p 所需的時間步數
 class LinearSchedule(object):  # 沒繼承還寫上 "Object" -> 這是舊式寫法，效果同 Class LinearSchedule():
@@ -169,8 +172,8 @@ class WGAN_GP_Agent(object):
         self.lr_G = 1e-4
         self.lr_D = 1e-4
         self.target_net_update_freq = 10  # target_G 參數逼近 G (instead of sync.) every 10 steps
-        self.experience_replay_size = 2000
-        self.batch_size = 32
+        self.experience_replay_size = 2000  # 2000
+        self.batch_size = 32  # 32
         self.update_freq = 200  # update WGAN_GP every 200 learning windows
         # 一次 update 會更新 len(memroy) / 32 輪。每輪更新 n_critic 次 D，n_gen 次 G
         self.learn_start = 0  # 從第幾步開始允許模型開始更新參數
@@ -324,6 +327,7 @@ class WGAN_GP_Agent(object):
         return samples.mean(2).max(1)[1].view(next_states.size(0), 1, 1).expand(-1, -1, self.num_samples)
 
     # 計算 GP (Gradient Penalty)
+    # real_data & fake_data.shape = (self.batch_size, self.num_samples)
     def calc_gradient_penalty(self, real_data, fake_data, noise):
         # 找 ε，為 real_data & fake_data 的混合比例
         alpha = torch.rand(self.batch_size, 1)
@@ -338,8 +342,27 @@ class WGAN_GP_Agent(object):
         gradients = grad(outputs=disc_interpolates, inputs=interpolates, 
                         grad_outputs=torch.ones(disc_interpolates.size()).to(self.device),
                         create_graph=True, retain_graph=True, only_inputs=True)[0]
+        # mean() 是因為總共有 num_samples 個 Q 值，要取其 mean() 作為 gradient 代表
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * self.lambda_
         return gradient_penalty
+    
+    # 計算 LP (Lipschitz Penalty)
+    def calc_lipschitz_penalty(self, real_data, fake_data, noise):
+        # 找 ε，為 real_data & fake_data 的混合比例
+        alpha = torch.rand(self.batch_size, 1)
+        alpha = alpha.expand(real_data.size()).to(self.device)
+        # interpolates = x_hat，即檢查點
+        interpolates = alpha * real_data.data + (1 - alpha) * fake_data.data
+        # 因為後面要使用 grad() 去算其梯度
+        interpolates.requires_grad = True
+
+        # 算 LP
+        disc_interpolates = self.D_model(interpolates, noise)
+        gradients = grad(outputs=disc_interpolates, inputs=interpolates, 
+                        grad_outputs=torch.ones(disc_interpolates.size()).to(self.device),
+                        create_graph=True, retain_graph=True, only_inputs=True)[0]
+        lipschitz_penalty = (max(0, ((gradients.norm(2, dim=1) - 1) ** 2).mean())) * self.lambda_
+        return lipschitz_penalty
 
     # 自己控制 G & D 的學習率，隨時間遞減。不單只靠 Adam
     # 0~2999 -> self.lr_G
@@ -434,10 +457,14 @@ class WGAN_GP_Agent(object):
                 # E[D(G(s, tau))]
                 D_fake = self.D_model(current_q_values_samples, D_noise)
                 D_fake_loss = torch.mean(D_fake) # 
-                # 計算 p(lambda_) by calc_gradient_penalty()
-                gradient_penalty = self.calc_gradient_penalty(expected_q_values_samples, current_q_values_samples, D_noise)
+
+                # 計算 GP by calc_gradient_penalty()
+                # gradient_penalty = self.calc_gradient_penalty(expected_q_values_samples, current_q_values_samples, D_noise)
+                # 從 GP 改為 LP (by calc_lipschitz_penalty())
+                lipschitz_penalty = self.calc_lipschitz_penalty(expected_q_values_samples, current_q_values_samples, D_noise)
+
                 # 計算 Loss_D
-                D_loss = D_fake_loss - D_real_loss + gradient_penalty
+                D_loss = D_fake_loss - D_real_loss + lipschitz_penalty
                 # update D 的參數
                 self.D_model.zero_grad()
                 D_loss.backward()
@@ -691,7 +718,7 @@ for frame in tqdm(range(1, total_timesteps + 1)):
     env.activity()
     
     
-    print(f'GANDDQN=====episode: {frame}, epsilon: {epsilon:.3f}, utility: {utility}, reward: {reward:.5f}')
+    print(f'\nGANDDQN=====episode: {frame}, epsilon: {epsilon:.3f}, utility: {utility}, reward: {reward:.5f}')
     print(f'qoe: volte = {qoe[0]}, video = {qoe[1]}, urllc = {qoe[2]}')
     print('bandwidth-allocation solution', action_space[action])
 
