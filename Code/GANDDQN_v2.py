@@ -426,9 +426,18 @@ class WGAN_GP_Agent(object):
                 batch_vars = self.prep_minibatch(slicing_idx[t], slicing_idx[t+1])
                 batch_state, batch_action, batch_reward, batch_next_state = batch_vars
                 # batch_action 的 shape 從 (batch_size, 1) 轉成 (batch_size, 1, 1) by unsqueeze 
-                # 再轉成 (self.batch_size, 1, self.num_samples) by expand
+                # 再轉成 (self.batch_size, 1, self.num_samples) by expand (值等同於對應的 action)
+                # ex: 
+                # a = torch.tensor([[1], [2], [3]])  # shape = (3, 1)
+                # a = a.unsqueeze(dim= -1)  # shape = (3, 1, 1)
+                # a = a.expand(-1, -1, 5)  # shape = (3, 1, 5)
+                # output : 
+                # tensor([ [ [1, 1, 1, 1, 1] ],
+                #          [ [2, 2, 2, 2, 2] ],
+                #          [ [3, 3, 3, 3, 3] ]
+                #        ])
                 # 這樣轉 shape 是為了當作下面 gather 的 index。
-                batch_action = batch_action.unsqueeze(dim = -1).expand(-1, -1, self.num_samples)
+                batch_action = batch_action.unsqueeze(dim = -1).expand(-1, -1, self.num_samples)  # output_shape = (self.batch_size, 1, self.num_samples)
 
                 # 取得 G 生成的 Q 值機率分布。(fake)，shape : (self.batch_size, self.num_samples)
                 G_noise = (torch.rand(self.batch_size, self.num_samples)).to(self.device)
