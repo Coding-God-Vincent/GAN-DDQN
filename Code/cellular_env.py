@@ -2,8 +2,11 @@
 0. 本論文的時間定義：
         frame = learning window = 1s = 2000 subframe (每一個 frame 做一次上層 by GAN-DDQN)
         time_subframe = 0.5ms (每一個 time_subframe 做一次下層 by RR) (我自己把 time_subframe 叫 timeslot)
+
 1. For downlink simulations in one-single base station environment.
+
 2. This simulation is based on 4G LTE & 3GPP TS 36.814 Standard.
+
 3. unit in this environment: 
     tx, rx power : dBW
     gain, loss   : dB (dB : relative unit, 10 x log_10 (A / B))
@@ -18,7 +21,7 @@ class cellularEnv(object):
     def __init__(self,
                  
         # Base Station Position & Area
-        BS_pos = np.array([0,0]),
+        BS_pos = np.array([0, 0]),
         BS_radius = 40,
         
         # BS transmit power # tx = transmit
@@ -40,6 +43,7 @@ class cellularEnv(object):
         chan_mod = '36814',
         
         # 用在說明使用的頻段的中心頻率，即使用哪一段的 spectrum
+        # 在此環境中沒用到
         carrier_freq = 2 * 10 ** 9, # 2 GHz
         # 總共可用頻寬為 10MHz
         band_whole = 10 * 10 ** 6, # unit = Hz
@@ -54,9 +58,9 @@ class cellularEnv(object):
         schedu_method = 'round_robin',
         
         # 網路切片種類 (VoLTE、eMBB、URLLC)
-        ser_cat = ['volte','embb_general','urllc'],
+        ser_cat = ['volte', 'embb_general', 'urllc'],
         # 隨機分配 UE 的服務需求 (VoLTE : eMBB : URLLC = 6 : 6 : 1)
-        ser_prob = np.array([6,6,1], dtype=np.float32),
+        ser_prob = np.array([6, 6, 1], dtype= np.float32),
 
         # MIMO 天線數
         dl_mimo = 32,
@@ -129,7 +133,7 @@ class cellularEnv(object):
         # 依照前面的機率分布產生各 UE 要使用的網路切片種類，shape : (UE_max_no)
         self.UE_cat = np.random.choice(self.ser_cat, self.UE_max_no, p=self.ser_prob)
 
-        # tx_pkt_no 為每個類型網路切片成功傳輸的封包數的計數器，唯一個長度為 3 的 np.ndarray
+        # tx_pkt_no 為每個類型網路切片於一個 learning window 所欲傳輸的封包總數，為一個長度為 3 的 np.ndarray
         self.tx_pkt_no = np.zeros(len(self.ser_cat))
 
     #=======================================================================================================================================#
@@ -140,7 +144,7 @@ class cellularEnv(object):
             # path_loss.shape = (UE_max_no, 1)，為每一個 UE 會有的 path_loss
             # 後面的 random.normal(...) 會產生出一個 (UE_max_no) 的 np.ndarray，內容為各 UE 的 shadow fading 值
             # 最後 reshape() 會將 shape 從 (UE_max_no) 轉成 (UE_max_no, 1)
-            self.chan_loss = self.path_loss + np.random.normal(0, shadowing_var, self.UE_max_no).reshape(-1,1)  
+            self.chan_loss = self.path_loss + np.random.normal(0, shadowing_var, self.UE_max_no).reshape(-1, 1)  
 
     #=======================================================================================================================================#
     # 排程模型 : 網路切片分 RB 給其 UE，下面所說的兩種分法是分配在均分給 Active Users 後剩餘的 RB
@@ -488,9 +492,10 @@ class cellularEnv(object):
             self.tx_pkt_no[ser_index] = np.where(self.UE_buffer[:,ue_index_]!=0)[0].size'''
         self.succ_tx_pkt_no = np.zeros(len(self.ser_cat))
         self.sys_se_per_frame = np.zeros(1)  
-        self.UE_buffer = np.zeros(self.UE_buffer.shape)
-        self.UE_buffer_backup = np.zeros(self.UE_buffer.shape)
-        self.UE_latency = np.zeros(self.UE_buffer.shape)
+        # ** 應該接續上一個 learning window
+        # self.UE_buffer = np.zeros(self.UE_buffer.shape)
+        # self.UE_buffer_backup = np.zeros(self.UE_buffer.shape)
+        # self.UE_latency = np.zeros(self.UE_buffer.shape)
           
 #=======================================================================================================================================#
 # 模擬封包傳輸給 ue_id 的 UE 的過程 : 所有封包共用 rate，從 index0 的開始傳

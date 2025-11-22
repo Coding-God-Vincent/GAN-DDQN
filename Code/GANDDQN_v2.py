@@ -713,6 +713,7 @@ for frame in tqdm(range(1, total_timesteps + 1)):
     utilities.append(utility)
 
     # 準備做下一次的上層，取出 state
+    # 該 state 為上一個 learning window 中，各網路切片欲傳輸的封包總數
     observation = state_update(env.tx_pkt_no, env.ser_cat)
     
     # 將 experience 存入 replay buffer
@@ -724,7 +725,7 @@ for frame in tqdm(range(1, total_timesteps + 1)):
     # 結束一個 learning window，重設相關計數器
     env.countReset()
     # 設定各 UE readtime，並根據該 readtime 決定是否新增封包
-    env.activity()
+    env.activity() 
     
     
     print(f'\nGANDDQN=====episode: {frame}, epsilon: {epsilon:.3f}, utility: {utility}, reward: {reward:.5f}')
@@ -775,7 +776,7 @@ ma_utility = moving_average(utilities_, window_size = 200)
 
 # loss figure (figure(2))
 model.plot_loss()
-plt.savefig("loss.png")
+plt.savefig("/home/super_trumpet/NCKU/Paper/Reference (with code)/GAN-DDQN/Code/Cont_env_figure/loss.png")
 
 # qoe figure (figure(3))
 plt.figure(3)
@@ -787,7 +788,7 @@ plt.plot(ma_qoe_volte)
 plt.plot(ma_qoe_embb)
 plt.plot(ma_qoe_urllc)
 plt.legend(["VoLTE", "Video", "URLLC"])
-plt.savefig("QoE.png")
+plt.savefig("/home/super_trumpet/NCKU/Paper/Reference (with code)/GAN-DDQN/Code/Cont_env_figure/QoE.png")
 
 # se figure (figure(4))
 plt.figure(4)
@@ -796,7 +797,7 @@ plt.title('SE')
 plt.xlabel('Episode')
 plt.ylabel('bits/Hz')
 plt.plot(ma_SE)
-plt.savefig("SE.png")
+plt.savefig("/home/super_trumpet/NCKU/Paper/Reference (with code)/GAN-DDQN/Code/Cont_env_figure/SE.png")
 
 # utility figure (figure(5))
 plt.figure(5)
@@ -805,7 +806,7 @@ plt.title('Utility')
 plt.xlabel("Episode")
 plt.ylabel("utility")
 plt.plot(ma_utility)
-plt.savefig("Utility.png")
+plt.savefig("/home/super_trumpet/NCKU/Paper/Reference (with code)/GAN-DDQN/Code/Cont_env_figure/Utility.png")
 
 
 # %%
